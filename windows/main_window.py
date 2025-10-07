@@ -1,12 +1,26 @@
-from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
-                               QWidget, QLabel, QPushButton, QTextEdit,
-                               QScrollArea, QFrame, QLineEdit, QSplitter,
-                               QListWidget, QListWidgetItem, QFileDialog,
-                               QMessageBox, QStatusBar, QToolBar)
+import os
+import mimetypes
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices, QImageReader
+from windows.settings_dialog import SettingsDialog
+from PySide6.QtWidgets import (
+    QMainWindow, QVBoxLayout, QHBoxLayout,
+    QWidget, QLabel, QPushButton, QTextEdit,
+    QScrollArea, QFrame, QLineEdit, QSplitter,
+    QListWidget, QListWidgetItem, QFileDialog,
+    QMessageBox, QStatusBar, QToolBar, QDialog, QMenu,
+    QStackedWidget, QInputDialog
+)
 from PySide6.QtCore import Qt, QTimer, QDateTime, Signal
 from PySide6.QtGui import QFont, QIcon, QAction, QPixmap
 import json
 from styles.theme_manager import theme_manager, ThemeType
+from data.test_data import TEST_CHATS  # тестовые чаты
+from windows.widgets.chat_list import ChatList
+from realtime.realtime_client import FakeRealtimeClient
+
+
+STATUS_CHOICES = ("Новая", "В работе", "Ожидает клиента", "Ожидает оператора", "Закрыта")
 
 
 class MessageBubble(QFrame):
@@ -16,8 +30,6 @@ class MessageBubble(QFrame):
         self.is_user = is_user
         self.setup_ui()
         self.apply_theme()
-
-        # Подключаем обновление темы
         theme_manager.theme_changed.connect(self.apply_theme)
 
     def setup_ui(self):
@@ -25,12 +37,10 @@ class MessageBubble(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(4)
 
-        # Основной текст сообщения
         self.message_label = QLabel(self.message_data["text"])
         self.message_label.setWordWrap(True)
         self.message_label.setFont(QFont("Arial", 10))
 
-        # Время и статус
         info_layout = QHBoxLayout()
         self.time_label = QLabel(self.message_data["time"])
         self.time_label.setFont(QFont("Arial", 8))
@@ -38,12 +48,10 @@ class MessageBubble(QFrame):
         info_layout.addWidget(self.time_label)
 
         if self.is_user:
-            # Статус доставки для сообщений пользователя
             self.status_label = QLabel("✓✓" if self.message_data.get("delivered", True) else "✓")
             self.status_label.setFont(QFont("Arial", 8))
             info_layout.addWidget(self.status_label)
         else:
-            # Имя оператора для сообщений поддержки
             self.operator_label = QLabel(self.message_data.get("operator", "Поддержка"))
             self.operator_label.setFont(QFont("Arial", 8))
             info_layout.addWidget(self.operator_label)
@@ -52,31 +60,28 @@ class MessageBubble(QFrame):
         layout.addLayout(info_layout)
 
     def apply_theme(self):
-        """Применяем тему к пузырьку сообщения"""
         theme_data = theme_manager.get_theme_styles()
         colors = theme_data["colors"]
 
         if self.is_user:
-            # Сообщения пользователя (справа, синие)
             self.setStyleSheet(f"""
                 QFrame {{
                     background-color: {colors["user_message"]};
                     border-radius: 12px;
                     color: white;
-                    max-width: 300px;
+                    max-width: 360px;
                 }}
             """)
-            self.time_label.setStyleSheet(f"color: rgba(255, 255, 255, 0.7);")
+            self.time_label.setStyleSheet("color: rgba(255, 255, 255, 0.7);")
             if hasattr(self, 'status_label'):
-                self.status_label.setStyleSheet(f"color: rgba(255, 255, 255, 0.8);")
+                self.status_label.setStyleSheet("color: rgba(255, 255, 255, 0.8);")
         else:
-            # Сообщения поддержки (слева, серые)
             self.setStyleSheet(f"""
                 QFrame {{
                     background-color: {colors["operator_message"]};
                     border-radius: 12px;
                     color: {colors["text_primary"]};
-                    max-width: 300px;
+                    max-width: 360px;
                     border: 1px solid {colors["border"]};
                 }}
             """)
@@ -85,15 +90,122 @@ class MessageBubble(QFrame):
                 self.operator_label.setStyleSheet(f"color: {colors['success']}; font-weight: bold;")
 
 
+class AttachmentBubble(QFrame):
+    def __init__(self, attach_data: dict, time_text: str, is_user=True):
+        super().__init__()
+        self.attach_data = attach_data  # keys: path, name, size, is_image
+        self.is_user = is_user
+        self.time_text = time_text
+        self.setup_ui()
+        self.apply_theme()
+        theme_manager.theme_changed.connect(self.apply_theme)
+
+    def setup_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(6)
+
+        # Превью
+        self.preview = QLabel()
+        self.preview.setScaledContents(False)
+
+        if self.attach_data.get("is_image"):
+            pix = QPixmap(self.attach_data["path"])
+            if not pix.isNull():
+                max_w = 320
+                if pix.width() > max_w:
+                    pix = pix.scaledToWidth(max_w, Qt.SmoothTransformation)
+                self.preview.setPixmap(pix)
+        else:
+            self.preview.setText("📎")
+
+        # Имя файла + размер
+        name = self.attach_data.get("name", os.path.basename(self.attach_data["path"]))
+        size = self.attach_data.get("size", "")
+        self.name_label = QLabel(f"{name} {f'• {size}' if size else ''}")
+        self.name_label.setWordWrap(True)
+        self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        # Низ: время (+ для user — delivered)
+        bottom = QHBoxLayout()
+        self.time_label = QLabel(self.time_text)
+        self.time_label.setFont(QFont("Arial", 8))
+        bottom.addWidget(self.time_label)
+        if self.is_user:
+            self.status_label = QLabel("✓✓")
+            self.status_label.setFont(QFont("Arial", 8))
+            bottom.addWidget(self.status_label)
+        bottom.addStretch()
+
+        lay.addWidget(self.preview)
+        lay.addWidget(self.name_label)
+        lay.addLayout(bottom)
+
+        # Клик по пузырю — открыть файл
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.attach_data["path"]))
+        return super().mousePressEvent(event)
+
+    def apply_theme(self):
+        colors = theme_manager.get_theme_styles()["colors"]
+        if self.is_user:
+            self.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {colors["user_message"]};
+                    border-radius: 12px;
+                    color: white;
+                    max-width: 360px;
+                }}
+                QLabel {{ color: white; }}
+            """)
+            self.time_label.setStyleSheet("color: rgba(255,255,255,0.75);")
+            if hasattr(self, 'status_label'):
+                self.status_label.setStyleSheet("color: rgba(255,255,255,0.85);")
+        else:
+            self.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {colors["operator_message"]};
+                    border-radius: 12px;
+                    color: {colors["text_primary"]};
+                    max-width: 360px;
+                    border: 1px solid {colors["border"]};
+                }}
+            """)
+            self.time_label.setStyleSheet(f"color: {colors['text_muted']};")
+
+
+
 class ChatArea(QScrollArea):
+    files_dropped = Signal(list)
+
     def __init__(self):
         super().__init__()
         self.setup_ui()
         self.messages = []
         self.apply_theme()
-
-        # Подключаем обновление темы
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
         theme_manager.theme_changed.connect(self.apply_theme)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = []
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                paths.append(url.toLocalFile())
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
     def setup_ui(self):
         self.setWidgetResizable(True)
@@ -108,7 +220,6 @@ class ChatArea(QScrollArea):
         self.setWidget(self.chat_widget)
 
     def apply_theme(self):
-        """Применяем тему к области чата"""
         theme_data = theme_manager.get_theme_styles()
         colors = theme_data["colors"]
 
@@ -132,6 +243,44 @@ class ChatArea(QScrollArea):
             }}
         """)
 
+    def clear_messages(self):
+        # Удаляем все, кроме финального stretch
+        for i in range(self.chat_layout.count() - 2, -1, -1):
+            item = self.chat_layout.itemAt(i)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+        self.messages.clear()
+
+    def load_messages(self, messages):
+        self.clear_messages()
+        for msg in messages:
+            if "attachment" in msg:
+                self.add_attachment(msg["attachment"], is_user=(msg.get("sender") == "user"), time_text=msg.get("time"))
+            else:
+                is_user = (msg.get("sender") == "user")
+                self.add_message(msg.get("text", ""), is_user=is_user, operator=msg.get("operator"))
+
+    def add_attachment(self, attach_data: dict, is_user=True, time_text=None):
+        if not time_text:
+            time_text = QDateTime.currentDateTime().toString("hh:mm")
+        bubble = AttachmentBubble(attach_data, time_text, is_user)
+
+        container = QWidget()
+        cl = QHBoxLayout(container)
+        cl.setContentsMargins(0, 0, 0, 0)
+        if is_user:
+            cl.addStretch(); cl.addWidget(bubble)
+        else:
+            cl.addWidget(bubble); cl.addStretch()
+
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, container)
+        QTimer.singleShot(100, self.scroll_to_bottom)
+
+        # локальная модель (для автоскролла и простых сценариев)
+        self.messages.append({"attachment": attach_data, "time": time_text})
+
+
     def add_message(self, text, is_user=True, operator=None):
         current_time = QDateTime.currentDateTime().toString("hh:mm")
 
@@ -140,13 +289,11 @@ class ChatArea(QScrollArea):
             "time": current_time,
             "delivered": True
         }
-
         if not is_user and operator:
             message_data["operator"] = operator
 
         bubble = MessageBubble(message_data, is_user)
 
-        # Создаем контейнер для выравнивания
         container = QWidget()
         container_layout = QHBoxLayout(container)
         container_layout.setContentsMargins(0, 0, 0, 0)
@@ -158,10 +305,7 @@ class ChatArea(QScrollArea):
             container_layout.addWidget(bubble)
             container_layout.addStretch()
 
-        # Вставляем перед stretch
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, container)
-
-        # Прокручиваем вниз
         QTimer.singleShot(100, self.scroll_to_bottom)
 
         self.messages.append(message_data)
@@ -171,92 +315,407 @@ class ChatArea(QScrollArea):
         scrollbar.setValue(scrollbar.maximum())
 
 
+class HistoryDialog(QDialog):
+    """
+    Простая история чатов: список с подсветкой статусов, открытие по двойному клику,
+    удаление по кнопке/контекстному меню.
+    """
+    def __init__(self, chats, on_open, on_delete, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("История чатов")
+        self.resize(520, 420)
+        self.on_open = on_open
+        self.on_delete = on_delete
+        self.chats = list(chats)  # локальная копия
+
+        layout = QVBoxLayout(self)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.SingleSelection)
+        self.list_widget.itemDoubleClicked.connect(self._open_selected)
+
+        # Контекстное меню
+        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+        # Кнопки
+        buttons = QHBoxLayout()
+        self.open_btn = QPushButton("Открыть")
+        self.del_btn = QPushButton("Удалить")
+        self.close_btn = QPushButton("Закрыть")
+
+        self.open_btn.clicked.connect(self._open_selected)
+        self.del_btn.clicked.connect(self._delete_selected)
+        self.close_btn.clicked.connect(self.accept)
+
+        buttons.addStretch()
+        buttons.addWidget(self.open_btn)
+        buttons.addWidget(self.del_btn)
+        buttons.addWidget(self.close_btn)
+
+        layout.addWidget(self.list_widget)
+        layout.addLayout(buttons)
+
+        self._reload()
+
+    def _status_emoji(self, status):
+        mapping = {
+            "Новая": "🆕",
+            "В работе": "🟢",
+            "Ожидает клиента": "🟡",
+            "Закрыта": "⚪"
+        }
+        return mapping.get(status, "💬")
+
+    def _status_color(self, status, colors):
+        if status == "Новая":
+            return colors["primary"]
+        if status == "В работе":
+            return colors["success"]
+        if status == "Ожидает клиента":
+            return colors["warning"]
+        if status == "Закрыта":
+            return colors["text_muted"]
+        return colors["text_secondary"]
+
+    def _reload(self):
+        self.list_widget.clear()
+        colors = theme_manager.get_theme_styles()["colors"]
+
+        # новее — выше
+        def sort_key(ch):
+            return ch.get("updated_at", ""), ch.get("id", "")
+        for chat in sorted(self.chats, key=sort_key, reverse=True):
+            item = QListWidgetItem()
+            text = f"{self._status_emoji(chat['status'])} [{chat['status']}] {chat['id']} — {chat['title']} • {chat.get('updated_at','')}"
+            item.setText(text)
+            # Цвет по статусу
+            item.setForeground(Qt.black if theme_manager.get_current_theme() == ThemeType.LIGHT else Qt.white)
+            # Добавим легкую подсветку в зависимости от статуса через background (не aggressively ярко)
+            item.setData(Qt.UserRole, chat["id"])
+            self.list_widget.addItem(item)
+
+    def _selected_chat_id(self):
+        it = self.list_widget.currentItem()
+        if not it:
+            return None
+        return it.data(Qt.UserRole)
+
+    def _open_selected(self):
+        chat_id = self._selected_chat_id()
+        if not chat_id:
+            return
+        if self.on_open:
+            self.on_open(chat_id)
+        self.accept()
+
+    def _delete_selected(self):
+        chat_id = self._selected_chat_id()
+        if not chat_id:
+            return
+        if QMessageBox.question(self, "Удалить чат",
+                                "Удалить выбранный чат? Это действие необратимо.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            # Удаляем локально и через колбэк
+            self.chats = [c for c in self.chats if c["id"] != chat_id]
+            if self.on_delete:
+                self.on_delete(chat_id)
+            self._reload()
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        open_action = menu.addAction("Открыть")
+        del_action = menu.addAction("Удалить")
+        act = menu.exec_(self.list_widget.mapToGlobal(pos))
+        if act == open_action:
+            self._open_selected()
+        elif act == del_action:
+            self._delete_selected()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, user_data):
         super().__init__()
         self.user_data = user_data
-
-        # Инициализируем переменную toolbar
         self.main_toolbar = None
 
-        # Подключаем обновление темы
+        # Состояние чатов пользователя
+        self.chats = []           # список словарей чатов конкретного пользователя
+        self.chats_by_id = {}     # индекс по id
+        self.active_chat = None   # текущая заявка
+
         theme_manager.theme_changed.connect(self.apply_theme)
 
         self.setup_ui()
         self.setup_toolbar()
+        self.load_user_chats()
+        self.build_left_list()
+        self.show_empty_state()
+        self._init_realtime()
         self.setup_statusbar()
-        self.apply_theme()  # Применяем тему после создания всех элементов
-        self.load_sample_messages()
+        self.apply_theme()
+
+    def _init_realtime(self):
+        self.rtc = FakeRealtimeClient(self.user_data["id"])
+        self.rtc.connected.connect(lambda: self.connection_status.setText("🟢 Подключен"))
+        self.rtc.disconnected.connect(lambda: self.connection_status.setText("🔴 Отключен"))
+        self.rtc.message_received.connect(self._on_rt_message)
+        self.rtc.status_changed.connect(self._on_rt_status)
+        self.rtc.connect()
+
+    def _on_rt_message(self, chat_id, msg):
+        # дополним временем
+        msg.setdefault("time", QDateTime.currentDateTime().toString("hh:mm"))
+        chat = self.chats_by_id.get(chat_id)
+        if not chat:
+            return
+        chat["messages"].append(msg)
+        chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        self.chat_list.upsert_chat(chat)
+        if self.active_chat and self.active_chat["id"] == chat_id:
+            self.chat_area.add_message(msg["text"], is_user=(msg.get("sender") == "user"), operator=msg.get("operator"))
+            self.update_header_for_chat()
+
+    def _on_rt_status(self, chat_id, status):
+        self.change_status(chat_id, status)
 
     def setup_ui(self):
         self.setWindowTitle(f"Чат поддержки - {self.user_data['name']}")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 900, 640)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        # Основной макет
         main_layout = QVBoxLayout(central_widget)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Заголовок с информацией о пользователе
         self.header = self.create_header()
         main_layout.addWidget(self.header)
 
-        # Разделитель
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter, 1)
 
-        # Область чата
-        chat_container = QWidget()
-        chat_layout = QVBoxLayout(chat_container)
+        # LEFT: панель со списком, поиском и массовыми действиями
+        self.left_panel = self.create_left_panel()
+
+        # CENTER: стек (пустое состояние / чат)
+        self.center_stack = QStackedWidget()
+
+        # Пустое состояние
+        self.empty_state = self.create_empty_state()
+        self.center_stack.addWidget(self.empty_state)
+
+        # Страница чата
+        self.chat_page = QWidget()
+        chat_layout = QVBoxLayout(self.chat_page)
         chat_layout.setContentsMargins(0, 0, 0, 0)
         chat_layout.setSpacing(0)
 
         self.chat_area = ChatArea()
+        self.chat_area.files_dropped.connect(self.on_files_dropped)
         chat_layout.addWidget(self.chat_area, 1)
-
-        # Панель ввода
         self.input_panel = self.create_input_panel()
         chat_layout.addWidget(self.input_panel)
+        self.center_stack.addWidget(self.chat_page)
 
-        # Боковая панель с информацией
+        # RIGHT: боковая панель
         self.sidebar = self.create_sidebar()
 
-        splitter.addWidget(chat_container)
+        splitter.addWidget(self.left_panel)
+        splitter.addWidget(self.center_stack)
         splitter.addWidget(self.sidebar)
-        splitter.setSizes([600, 200])
+        splitter.setSizes([280, 580, 240])
+
+        # индексы
+        self.CENTER_EMPTY = 0
+        self.CENTER_CHAT = 1
+
+    def _human_size(self, num):
+        for unit in ['Б','КБ','МБ','ГБ','ТБ']:
+            if abs(num) < 1024.0:
+                return f"{num:.1f} {unit}"
+            num /= 1024.0
+        return f"{num:.1f} ПБ"
+
+    def _build_attachment_data(self, path: str):
+        name = os.path.basename(path)
+        try:
+            size = self._human_size(os.path.getsize(path))
+        except Exception:
+            size = ""
+        ext = os.path.splitext(name)[1].lower()
+        is_image = ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+        return {"path": path, "name": name, "size": size, "is_image": is_image}
+
+    def on_files_dropped(self, paths):
+        if not self.active_chat:
+            # если нет активного чата — создаем новый автоматически
+            self.create_new_chat()
+        for p in paths:
+            attach = self._build_attachment_data(p)
+            self.chat_area.add_attachment(attach, is_user=True)
+            msg_time = QDateTime.currentDateTime().toString("hh:mm")
+            self.active_chat["messages"].append({"sender": "user", "attachment": attach, "time": msg_time})
+        # статус
+        self.active_chat["status"] = "Ожидает оператора"
+        self.active_chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        self.update_header_for_chat()
+        self.chat_list.upsert_chat(self.active_chat)
+        self.rtc.send_message(self.active_chat["id"], "[attachment]")
+
+
+    def create_left_panel(self):
+        panel = QFrame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        # Поиск
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Поиск по названию или ID...")
+        self.search_input.textChanged.connect(self.apply_chat_filters)
+
+        # Фильтр статуса
+        from PySide6.QtWidgets import QComboBox, QHBoxLayout
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("Все статусы")
+        for st in STATUS_CHOICES:
+            self.status_filter.addItem(st)
+        self.status_filter.currentIndexChanged.connect(self.apply_chat_filters)
+
+        # Массовые действия
+        self.bulk_close_btn = QPushButton("✔ Закрыть выбранные")
+        self.bulk_delete_btn = QPushButton("🗑 Удалить выбранные")
+        self.bulk_close_btn.clicked.connect(self.bulk_close_selected)
+        self.bulk_delete_btn.clicked.connect(self.bulk_delete_selected)
+
+        # Список
+        self.chat_list = ChatList()
+        self.chat_list.chat_selected.connect(self.set_active_chat)
+        self.chat_list.chat_rename.connect(self.rename_chat)
+        self.chat_list.chat_delete.connect(self.delete_chat)
+        self.chat_list.chat_change_status.connect(self.change_status)
+
+        lay.addWidget(self.search_input)
+        lay.addWidget(self.status_filter)
+        lay.addWidget(self.bulk_close_btn)
+        lay.addWidget(self.bulk_delete_btn)
+        lay.addWidget(self.chat_list, 1)
+        return panel
+
+    def bulk_close_selected(self):
+        ids = self.chat_list.get_selected_ids()
+        if not ids:
+            return
+        if QMessageBox.question(self, "Закрыть заявки", f"Закрыть выбранные ({len(ids)}) заявки?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        for cid in ids:
+            self.change_status(cid, "Закрыта")
+        self.apply_chat_filters()
+
+    def bulk_delete_selected(self):
+        ids = self.chat_list.get_selected_ids()
+        if not ids:
+            return
+        if QMessageBox.question(self, "Удалить заявки", f"Удалить выбранные ({len(ids)}) заявки?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        for cid in ids:
+            self.delete_chat(cid)
+        self.apply_chat_filters()
+
+
+    def apply_chat_filters(self):
+        query = (self.search_input.text() or "").strip().lower()
+        status = self.status_filter.currentText()
+        filtered = []
+        for c in self.chats:
+            if status != "Все статусы" and c.get("status") != status:
+                continue
+            if query and (query not in c["title"].lower() and query not in c["id"].lower()):
+                continue
+            filtered.append(c)
+        self.chat_list.set_chats(filtered)
+        # подсветим активный, если он в фильтре
+        if self.active_chat and any(c["id"] == self.active_chat["id"] for c in filtered):
+            self.chat_list.select_chat(self.active_chat["id"])
+
+
+    def create_empty_state(self):
+        panel = QFrame()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch()
+        title = QLabel("Нет активного диалога")
+        title.setFont(QFont("Arial", 14, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        subtitle = QLabel("Выберите диалог слева или создайте новую заявку")
+        subtitle.setAlignment(Qt.AlignCenter)
+        btn = QPushButton("🆕 Создать заявку")
+        btn.setFixedSize(220, 44)
+        btn.clicked.connect(self.create_new_chat)
+
+        lay.addWidget(title)
+        lay.addWidget(subtitle)
+        hl = QHBoxLayout()
+        hl.addStretch()
+        hl.addWidget(btn)
+        hl.addStretch()
+        lay.addLayout(hl)
+        lay.addStretch()
+        return panel
+
+    def show_empty_state(self):
+        self.active_chat = None
+        self.center_stack.setCurrentIndex(self.CENTER_EMPTY)
+        self.update_header_for_chat()
+
+    def build_left_list(self):
+        self.chat_list.set_chats(self.chats)
 
     def create_header(self):
         header = QFrame()
-        header.setFixedHeight(60)
+        header.setFixedHeight(68)
 
         layout = QHBoxLayout(header)
         layout.setContentsMargins(20, 10, 20, 10)
+        layout.setSpacing(14)
 
-        # Аватар пользователя
         self.avatar_label = QLabel(self.user_data["avatar"])
-        self.avatar_label.setStyleSheet("font-size: 20px;")
-        self.avatar_label.setFixedSize(40, 40)
+        self.avatar_label.setStyleSheet("font-size: 22px;")
+        self.avatar_label.setFixedSize(44, 44)
         self.avatar_label.setAlignment(Qt.AlignCenter)
 
-        # Информация о пользователе
         info_layout = QVBoxLayout()
         info_layout.setSpacing(2)
 
         self.name_label = QLabel(self.user_data["name"])
         self.name_label.setFont(QFont("Arial", 12, QFont.Bold))
 
+        # Блок с ID пользователя + текущая заявка (ID + статус)
+        sub_layout = QHBoxLayout()
+        sub_layout.setSpacing(8)
         self.details_label = QLabel(f"ID: {self.user_data['id']} • {self.user_data['status']}")
         self.details_label.setFont(QFont("Arial", 9))
 
-        info_layout.addWidget(self.name_label)
-        info_layout.addWidget(self.details_label)
+        self.ticket_label = QLabel("")            # NEW: CH-XXXX
+        self.ticket_label.setFont(QFont("Arial", 9, QFont.Bold))
+        self.ticket_status_label = QLabel("")     # NEW: Чип статуса
+        self.ticket_status_label.setFont(QFont("Arial", 9, QFont.Bold))
+        self.ticket_status_label.setContentsMargins(8, 2, 8, 2)
 
-        # Статус подключения
+        sub_layout.addWidget(self.details_label)
+        sub_layout.addSpacing(10)
+        sub_layout.addWidget(self.ticket_label)
+        sub_layout.addWidget(self.ticket_status_label)
+        sub_layout.addStretch()
+
+        info_layout.addWidget(self.name_label)
+        info_layout.addLayout(sub_layout)
+
         self.connection_status = QLabel("🟢 Подключен")
-        self.connection_status.setFont(QFont("Arial", 9))
+        self.connection_status.setFont(QFont("Arial", 10))
 
         layout.addWidget(self.avatar_label)
         layout.addLayout(info_layout, 1)
@@ -266,30 +725,26 @@ class MainWindow(QMainWindow):
 
     def create_input_panel(self):
         panel = QFrame()
-        panel.setFixedHeight(80)
+        panel.setFixedHeight(84)
 
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(15, 10, 15, 10)
         layout.setSpacing(10)
 
-        # Поле ввода сообщения
         self.message_input = QTextEdit()
-        self.message_input.setFixedHeight(50)
+        self.message_input.setFixedHeight(56)
         self.message_input.setPlaceholderText("Введите ваше сообщение...")
 
-        # Кнопки
         buttons_layout = QVBoxLayout()
-        buttons_layout.setSpacing(5)
+        buttons_layout.setSpacing(6)
 
-        # Кнопка прикрепить файл
         self.attach_btn = QPushButton("📎")
-        self.attach_btn.setFixedSize(35, 25)
+        self.attach_btn.setFixedSize(38, 26)
         self.attach_btn.setToolTip("Прикрепить файл")
         self.attach_btn.clicked.connect(self.attach_file)
 
-        # Кнопка отправить
         self.send_btn = QPushButton("Отправить")
-        self.send_btn.setFixedSize(80, 25)
+        self.send_btn.setFixedSize(92, 26)
         self.send_btn.clicked.connect(self.send_message)
 
         buttons_layout.addWidget(self.attach_btn)
@@ -298,24 +753,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.message_input, 1)
         layout.addLayout(buttons_layout)
 
-        # Отправка по Enter
+        # Отправка по Enter (без Shift)
         self.message_input.keyPressEvent = self.handle_key_press
 
         return panel
 
     def create_sidebar(self):
         sidebar = QFrame()
-        sidebar.setMaximumWidth(250)
+        sidebar.setMaximumWidth(270)
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(15)
+        layout.setSpacing(16)
 
-        # Заголовок боковой панели
         self.sidebar_title = QLabel("Информация")
-        self.sidebar_title.setFont(QFont("Arial", 12, QFont.Bold))
+        self.sidebar_title.setFont(QFont("Arial", 13, QFont.Bold))
 
-        # Информация о пользователе
         self.user_info = QLabel(f"""
         <b>Контактные данные:</b><br>
         📧 {self.user_data['email']}<br>
@@ -325,26 +778,27 @@ class MainWindow(QMainWindow):
         """)
         self.user_info.setWordWrap(True)
 
-        # Операторы онлайн
         self.operators_label = QLabel("Операторы онлайн:")
-        self.operators_label.setFont(QFont("Arial", 10, QFont.Bold))
+        self.operators_label.setFont(QFont("Arial", 11, QFont.Bold))
 
         self.operators_list = QListWidget()
-        self.operators_list.setMaximumHeight(100)
-
-        # Добавляем тестовых операторов
+        self.operators_list.setMaximumHeight(120)
         self.operators_list.addItem("👩‍💼 Анна Петрова")
         self.operators_list.addItem("👨‍💻 Михаил Сидоров")
         self.operators_list.addItem("👩‍💻 Елена Козлова")
 
-        # Кнопки действий
         self.actions_label = QLabel("Действия:")
-        self.actions_label.setFont(QFont("Arial", 10, QFont.Bold))
+        self.actions_label.setFont(QFont("Arial", 11, QFont.Bold))
 
         self.history_btn = QPushButton("📋 История чатов")
         self.settings_btn = QPushButton("⚙️ Настройки")
         self.logout_btn = QPushButton("🚪 Выход")
 
+        # NEW: быстрый доступ к "Новый чат" через контекст меню правой панели (не обязательно)
+        self.new_chat_btn = QPushButton("🆕 Новый чат")
+
+        self.history_btn.clicked.connect(self.open_history)
+        self.new_chat_btn.clicked.connect(self.create_new_chat)
         self.logout_btn.clicked.connect(self.logout)
 
         layout.addWidget(self.sidebar_title)
@@ -352,6 +806,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.operators_label)
         layout.addWidget(self.operators_list)
         layout.addWidget(self.actions_label)
+        layout.addWidget(self.new_chat_btn)
         layout.addWidget(self.history_btn)
         layout.addWidget(self.settings_btn)
         layout.addWidget(self.logout_btn)
@@ -363,19 +818,22 @@ class MainWindow(QMainWindow):
         self.main_toolbar = QToolBar()
         self.addToolBar(self.main_toolbar)
 
-        # Действия тулбара
         new_chat_action = QAction("🆕 Новый чат", self)
-        history_action = QAction("📋 История", self)
+        rename_action = QAction("✏️ Переименовать", self)
         settings_action = QAction("⚙️ Настройки", self)
 
-        # Добавляем переключение темы в тулбар
         theme_toggle_action = QAction("🌙/☀️ Тема", self)
         theme_toggle_action.setShortcut('Ctrl+T')
         theme_toggle_action.triggered.connect(theme_manager.toggle_theme)
 
+        # подключаем действия
+        new_chat_action.triggered.connect(self.create_new_chat)
+        rename_action.triggered.connect(lambda: self.rename_chat())
+        settings_action.triggered.connect(self.open_settings_placeholder)
+
         self.main_toolbar.addAction(new_chat_action)
         self.main_toolbar.addSeparator()
-        self.main_toolbar.addAction(history_action)
+        self.main_toolbar.addAction(rename_action)
         self.main_toolbar.addAction(settings_action)
         self.main_toolbar.addSeparator()
         self.main_toolbar.addAction(theme_toggle_action)
@@ -385,25 +843,139 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Готов к отправке сообщений")
 
-    def load_sample_messages(self):
-        """Загружаем образцы сообщений для демонстрации"""
-        sample_messages = [
-            {"text": "Добро пожаловать в службу поддержки! Чем могу помочь?", "is_user": False,
-             "operator": "Анна Петрова"},
-            {"text": "Здравствуйте! У меня проблема с доступом к личному кабинету.", "is_user": True},
-            {"text": "Понятно. Можете описать подробнее, какая именно ошибка появляется?", "is_user": False,
-             "operator": "Анна Петрова"}
-        ]
+    # ---------- Работа с чатами ----------
 
-        for msg in sample_messages:
-            self.chat_area.add_message(
-                msg["text"],
-                msg["is_user"],
-                msg.get("operator")
-            )
+    def load_user_chats(self):
+        """Загружаем чаты конкретного пользователя из тестовых данных"""
+        user_id = self.user_data["id"]
+        self.chats = [c for c in TEST_CHATS if c["user_id"] == user_id]
+        self.chats_by_id = {c["id"]: c for c in self.chats}
+
+    def select_initial_chat(self):
+        """Выбираем начальный чат: сначала 'В работе', затем 'Новая', иначе первый или создаем новый"""
+        chat = None
+        for st in ("В работе", "Новая"):
+            for c in self.chats:
+                if c["status"] == st:
+                    chat = c
+                    break
+            if chat:
+                break
+        if not chat and self.chats:
+            chat = self.chats[0]
+        if not chat:
+            chat = self._create_chat_object(title="Общая заявка", status="Новая")
+            self._add_chat(chat)
+        self.set_active_chat(chat["id"])
+
+    def set_active_chat(self, chat_id):
+        if chat_id not in self.chats_by_id:
+            return
+        self.active_chat = self.chats_by_id[chat_id]
+        self.update_header_for_chat()
+        self.chat_area.load_messages(self.active_chat.get("messages", []))
+        self.center_stack.setCurrentIndex(self.CENTER_CHAT)
+        self.chat_list.select_chat(chat_id)
+
+    def create_new_chat(self):
+        title, ok = self._ask_new_chat_title()
+        if not ok:
+            return
+        chat = self._create_chat_object(title=title or "Новая заявка", status="Новая")
+        self._add_chat(chat)
+        self.chat_list.upsert_chat(chat)
+        self.set_active_chat(chat["id"])
+        self.status_bar.showMessage(f"Создан новый чат {chat['id']}")
+
+    def _ask_new_chat_title(self):
+        # Простое окно ввода через QInputDialog можно, но чтобы не плодить зависимости, сделаем плейсхолдер
+        # Можно заменить на QInputDialog.getText(...) при желании
+        return ("Новая заявка", True)
+
+    def _create_chat_object(self, title, status="Новая"):
+        new_id = self._next_chat_id()
+        now_dt = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        return {
+            "id": new_id,
+            "user_id": self.user_data["id"],
+            "title": title,
+            "status": status,
+            "created_at": now_dt,
+            "updated_at": now_dt,
+            "messages": [
+                {"sender": "operator", "operator": "Анна Петрова", "text": "Здравствуйте! Чем можем помочь?", "time": QDateTime.currentDateTime().toString("hh:mm")}
+            ]
+        }
+
+    def _next_chat_id(self):
+        existing = [c["id"] for c in self.chats_by_id.values()]
+        max_n = 0
+        for cid in existing:
+            try:
+                n = int(cid.split("-")[1])
+                max_n = max(max_n, n)
+            except Exception:
+                pass
+        return f"CH-{max_n + 1:04d}"
+
+    def _add_chat(self, chat):
+        self.chats.append(chat)
+        self.chats_by_id[chat["id"]] = chat
+
+    def delete_chat(self, chat_id):
+        if chat_id not in self.chats_by_id:
+            return
+        deleting_active = (self.active_chat and self.active_chat["id"] == chat_id)
+        self.chats = [c for c in self.chats if c["id"] != chat_id]
+        self.chats_by_id.pop(chat_id, None)
+        self.chat_list.remove_chat(chat_id)
+        if deleting_active:
+            if self.chats:
+                self.set_active_chat(self.chats[0]["id"])
+            else:
+                self.show_empty_state()
+
+    def open_history(self):
+        dlg = HistoryDialog(
+            chats=self.chats,
+            on_open=self.set_active_chat,
+            on_delete=self.delete_chat,
+            parent=self
+        )
+        dlg.exec()
+
+    def open_settings_placeholder(self):
+        dlg = SettingsDialog(self)
+        dlg.exec()
+
+    # ---------- Отрисовка и статусы ----------
+
+    def get_status_color(self, status):
+        colors = theme_manager.get_theme_styles()["colors"]
+        if status == "Новая":
+            return colors["primary"]
+        if status == "В работе":
+            return colors["success"]
+        if status == "Ожидает клиента":
+            return colors["warning"]
+        if status == "Закрыта":
+            return colors["text_muted"]
+        if status == "Ожидает оператора":
+            return colors["warning"]
+        return colors["text_secondary"]
+
+    def update_header_for_chat(self):
+        if not self.active_chat:
+            self.ticket_label.setText("")
+            self.ticket_status_label.setText("")
+            return
+        self.ticket_label.setText(self.active_chat["id"])
+        self.ticket_status_label.setText(self.active_chat["status"])
+        # Стили чипа статуса будут заданы в apply_theme()
+
+    # ---------- Ввод/отправка сообщений ----------
 
     def handle_key_press(self, event):
-        """Обработка нажатий клавиш в поле ввода"""
         if event.key() == Qt.Key_Return and not event.modifiers() == Qt.ShiftModifier:
             self.send_message()
             event.accept()
@@ -411,55 +983,40 @@ class MainWindow(QMainWindow):
             QTextEdit.keyPressEvent(self.message_input, event)
 
     def send_message(self):
-        """Отправка сообщения"""
         text = self.message_input.toPlainText().strip()
         if not text:
             return
+        if not self.active_chat:
+            self.show_empty_state()
+            return
 
-        # Добавляем сообщение пользователя
         self.chat_area.add_message(text, is_user=True)
-
-        # Очищаем поле ввода
         self.message_input.clear()
 
-        # Здесь будет отправка на сервер
-        print(f"Отправлено сообщение: {text}")
+        msg_time = QDateTime.currentDateTime().toString("hh:mm")
+        self.active_chat["messages"].append({"sender": "user", "text": text, "time": msg_time})
+        # Новый статус
+        self.active_chat["status"] = "Ожидает оператора"
+        self.active_chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        self.update_header_for_chat()
+        self.chat_list.upsert_chat(self.active_chat)
 
-        # Обновляем статус
+        # Отправим в realtime-заглушку
+        self.rtc.send_message(self.active_chat["id"], text)
+
         self.status_bar.showMessage(f"Сообщение отправлено в {QDateTime.currentDateTime().toString('hh:mm:ss')}")
 
-        # Симулируем ответ оператора через 2 секунды
-        QTimer.singleShot(2000, self.simulate_operator_response)
-
-    def simulate_operator_response(self):
-        """Симуляция ответа оператора"""
-        responses = [
-            "Спасибо за обращение! Сейчас разберемся с вашей проблемой.",
-            "Передаю ваш запрос специалисту. Ожидайте ответа.",
-            "Попробуйте выполнить следующие действия...",
-            "Я вижу проблему. Исправляем."
-        ]
-
-        import random
-        response = random.choice(responses)
-        self.chat_area.add_message(response, is_user=False, operator="Анна Петрова")
-
     def attach_file(self):
-        """Прикрепление файла"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Выберите файл",
             "",
             "Все файлы (*.*)"
         )
-
         if file_path:
-            file_name = file_path.split('/')[-1]
-            self.chat_area.add_message(f"📎 Файл: {file_name}", is_user=True)
-            print(f"Прикреплен файл: {file_path}")
+            self.on_files_dropped([file_path])
 
     def logout(self):
-        """Выход из системы"""
         reply = QMessageBox.question(
             self,
             'Подтверждение выхода',
@@ -467,18 +1024,17 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-
         if reply == QMessageBox.Yes:
             self.close()
-            # Здесь можно снова показать окно входа
 
     def apply_theme(self):
-        """Применение текущей темы ко всем элементам"""
+        if hasattr(self, 'empty_state'):
+            # никаких спец. стилей — наследуется
+            pass
         theme_data = theme_manager.get_theme_styles()
         colors = theme_data["colors"]
         styles = theme_data["styles"]
 
-        # Основное окно
         self.setStyleSheet(f"""
             QMainWindow {{
                 background-color: {colors["background"]};
@@ -486,7 +1042,6 @@ class MainWindow(QMainWindow):
             }}
         """)
 
-        # Заголовок
         if hasattr(self, 'header'):
             self.header.setStyleSheet(f"""
                 QFrame {{
@@ -494,12 +1049,24 @@ class MainWindow(QMainWindow):
                     border-bottom: 1px solid {colors["border"]};
                 }}
             """)
-
             self.name_label.setStyleSheet(f"color: {colors['text_primary']};")
             self.details_label.setStyleSheet(f"color: {colors['text_muted']};")
             self.connection_status.setStyleSheet(f"color: {colors['success']};")
 
-        # Панель ввода
+            # Чип статуса и тикет
+            if self.active_chat:
+                st_color = self.get_status_color(self.active_chat["status"])
+            else:
+                st_color = colors["text_muted"]
+
+            self.ticket_label.setStyleSheet(f"color: {colors['text_secondary']};")
+            self.ticket_status_label.setStyleSheet(f"""
+                color: white;
+                background-color: {st_color};
+                border-radius: 10px;
+                padding: 2px 8px;
+            """)
+
         if hasattr(self, 'input_panel'):
             self.input_panel.setStyleSheet(f"""
                 QFrame {{
@@ -514,7 +1081,7 @@ class MainWindow(QMainWindow):
                     border: 2px solid {colors["border"]};
                     border-radius: 8px;
                     padding: 8px;
-                    font-size: 11px;
+                    font-size: 12px;
                     color: {colors["text_primary"]};
                 }}
                 QTextEdit:focus {{
@@ -522,15 +1089,15 @@ class MainWindow(QMainWindow):
                 }}
             """)
 
-            # Стили кнопок
             button_style = f"""
                 QPushButton {{
                     background-color: {colors["primary"]};
                     border: none;
-                    border-radius: 4px;
+                    border-radius: 6px;
                     color: white;
                     font-weight: bold;
-                    font-size: 10px;
+                    font-size: 11px;
+                    padding: 6px 10px;
                 }}
                 QPushButton:hover {{
                     background-color: {colors["primary_hover"]};
@@ -539,11 +1106,9 @@ class MainWindow(QMainWindow):
                     background-color: {colors["primary_pressed"]};
                 }}
             """
-
             self.send_btn.setStyleSheet(button_style)
             self.attach_btn.setStyleSheet(button_style)
 
-        # Боковая панель
         if hasattr(self, 'sidebar'):
             self.sidebar.setStyleSheet(f"""
                 QFrame {{
@@ -551,14 +1116,13 @@ class MainWindow(QMainWindow):
                     border-left: 1px solid {colors["border"]};
                 }}
             """)
-
             self.sidebar_title.setStyleSheet(f"""
                 color: {colors['text_primary']}; 
                 border-bottom: 1px solid {colors['border']}; 
-                padding-bottom: 5px;
+                padding-bottom: 6px;
             """)
-
-            self.user_info.setStyleSheet(f"color: {colors['text_secondary']}; font-size: 10px;")
+            # Увеличили шрифты правого меню
+            self.user_info.setStyleSheet(f"color: {colors['text_secondary']}; font-size: 12px;")
             self.operators_label.setStyleSheet(f"color: {colors['text_primary']};")
             self.actions_label.setStyleSheet(f"color: {colors['text_primary']};")
 
@@ -566,12 +1130,12 @@ class MainWindow(QMainWindow):
                 QListWidget {{
                     background-color: {colors["surface_alt"]};
                     border: 1px solid {colors["border"]};
-                    border-radius: 4px;
-                    font-size: 9px;
+                    border-radius: 6px;
+                    font-size: 11px;
                     color: {colors["text_secondary"]};
                 }}
                 QListWidget::item {{
-                    padding: 4px;
+                    padding: 6px;
                     border-bottom: 1px solid {colors["border"]};
                 }}
                 QListWidget::item:hover {{
@@ -580,15 +1144,14 @@ class MainWindow(QMainWindow):
                 }}
             """)
 
-            # Кнопки действий в сайдбаре
             sidebar_button_style = f"""
                 QPushButton {{
                     background-color: {colors["surface_alt"]};
                     border: 1px solid {colors["border"]};
-                    border-radius: 4px;
-                    padding: 6px;
+                    border-radius: 6px;
+                    padding: 8px;
                     text-align: left;
-                    font-size: 9px;
+                    font-size: 11px;
                     color: {colors["text_primary"]};
                 }}
                 QPushButton:hover {{
@@ -600,25 +1163,23 @@ class MainWindow(QMainWindow):
                     background-color: {colors["primary_pressed"]};
                 }}
             """
-
-            for btn in [self.history_btn, self.settings_btn, self.logout_btn]:
+            for btn in [self.history_btn, self.settings_btn, self.logout_btn, self.new_chat_btn]:
                 btn.setStyleSheet(sidebar_button_style)
 
-        # Тулбар
         if hasattr(self, 'main_toolbar') and self.main_toolbar:
             self.main_toolbar.setStyleSheet(f"""
                 QToolBar {{
                     background-color: {colors["surface_alt"]};
                     border-bottom: 1px solid {colors["border"]};
-                    spacing: 5px;
-                    padding: 5px;
+                    spacing: 6px;
+                    padding: 6px;
                 }}
                 QToolBar QToolButton {{
                     color: {colors["text_primary"]};
-                    font-size: 10px;
-                    padding: 4px 8px;
+                    font-size: 11px;
+                    padding: 6px 10px;
                     border: none;
-                    border-radius: 4px;
+                    border-radius: 6px;
                 }}
                 QToolBar QToolButton:hover {{
                     background-color: {colors["primary"]};
@@ -626,13 +1187,57 @@ class MainWindow(QMainWindow):
                 }}
             """)
 
-        # Статусбар
         if hasattr(self, 'status_bar'):
             self.status_bar.setStyleSheet(f"""
                 QStatusBar {{
                     background-color: {colors["surface_alt"]};
                     color: {colors["text_secondary"]};
                     border-top: 1px solid {colors["border"]};
-                    font-size: 9px;
+                    font-size: 10px;
                 }}
             """)
+
+        if hasattr(self, 'search_input'):
+            self.search_input.setStyleSheet(styles["input"])
+        if hasattr(self, 'status_filter'):
+            # простой стиль под тему
+            self.status_filter.setStyleSheet(f"""
+                        QComboBox {{
+                            background: {colors["surface_alt"]};
+                            color: {colors["text_primary"]};
+                            border: 1px solid {colors["border"]};
+                            border-radius: 6px;
+                            padding: 4px;
+                        }}
+                        QComboBox QAbstractItemView {{
+                            background: {colors["surface"]};
+                            color: {colors["text_primary"]};
+                            selection-background-color: {colors["primary"]};
+                        }}
+                    """)
+
+    def rename_chat(self, chat_id=None):
+        if chat_id is None:
+            chat_id = self.active_chat["id"] if self.active_chat else None
+        if not chat_id:
+            return
+        chat = self.chats_by_id.get(chat_id)
+        new_title, ok = QInputDialog.getText(self, "Переименовать заявку", "Название:", text=chat["title"])
+        if ok and new_title.strip():
+            chat["title"] = new_title.strip()
+            chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+            self.chat_list.upsert_chat(chat)
+            if self.active_chat and self.active_chat["id"] == chat_id:
+                self.update_header_for_chat()
+
+    def change_status(self, chat_id, status):
+        chat = self.chats_by_id.get(chat_id)
+        if not chat:
+            return
+        chat["status"] = status
+        chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        self.chat_list.upsert_chat(chat)
+        if self.active_chat and self.active_chat["id"] == chat_id:
+            self.update_header_for_chat()
+            self.apply_theme()
+

@@ -12,6 +12,13 @@ class ThemeManager(QObject):
 
     def __init__(self):
         super().__init__()
+        self._accent = "blue"
+        self._ACCENTS = {
+            "blue": {"primary": "#0078d4", "hover": "#106ebe", "pressed": "#005a9e"},
+            "green": {"primary": "#2e8b57", "hover": "#247a4f", "pressed": "#1e6a43"},
+            "purple": {"primary": "#7e57c2", "hover": "#6a4eb2", "pressed": "#5b3ea2"},
+            "orange": {"primary": "#ff8c00", "hover": "#ff7a00", "pressed": "#e06d00"},
+        }
         self._current_theme = ThemeType.DARK
         self._themes = {
             ThemeType.DARK: self._get_dark_theme(),
@@ -36,12 +43,13 @@ class ThemeManager(QObject):
         return self._themes[theme_type]
 
     def _get_dark_theme(self):
+        acc = self._ACCENTS[self._accent]
         return {
             "name": "Темная",
             "colors": {
-                "primary": "#0078d4",
-                "primary_hover": "#106ebe",
-                "primary_pressed": "#005a9e",
+                "primary": acc["primary"],
+                "primary_hover": acc["hover"],
+                "primary_pressed": acc["pressed"],
                 "background": "#2b2b2b",
                 "surface": "#333333",
                 "surface_alt": "#3c3c3c",
@@ -52,7 +60,7 @@ class ThemeManager(QObject):
                 "success": "#4ECDC4",
                 "warning": "#FFD700",
                 "error": "#FF6B6B",
-                "user_message": "#0078d4",
+                "user_message": acc["primary"],
                 "operator_message": "#3c3c3c",
                 "online": "#4ECDC4"
             },
@@ -63,23 +71,23 @@ class ThemeManager(QObject):
                         color: #ffffff;
                     }
                 """,
-                "button": """
-                    QPushButton {
-                        background-color: #0078d4;
-                        border: none;
-                        border-radius: 6px;
-                        color: white;
-                        font-weight: bold;
-                        font-size: 10px;
-                        padding: 8px 12px;
-                    }
-                    QPushButton:hover {
-                        background-color: #106ebe;
-                    }
-                    QPushButton:pressed {
-                        background-color: #005a9e;
-                    }
-                """,
+                "button": f"""
+                   QPushButton {{
+                       background-color: {acc["primary"]};
+                       border: none;
+                       border-radius: 6px;
+                       color: white;
+                       font-weight: bold;
+                       font-size: 10px;
+                       padding: 8px 12px;
+                   }}
+                   QPushButton:hover {{
+                       background-color: {acc["hover"]};
+                   }}
+                   QPushButton:pressed {{
+                       background-color: {acc["pressed"]};
+                   }}
+               """,
                 "input": """
                     QLineEdit, QTextEdit {
                         background-color: #3c3c3c;
@@ -116,12 +124,13 @@ class ThemeManager(QObject):
         }
 
     def _get_light_theme(self):
+        acc = self._ACCENTS[self._accent]
         return {
             "name": "Светлая",
             "colors": {
-                "primary": "#0078d4",
-                "primary_hover": "#106ebe",
-                "primary_pressed": "#005a9e",
+                "primary": acc["primary"],
+                "primary_hover": acc["hover"],
+                "primary_pressed": acc["pressed"],
                 "background": "#ffffff",
                 "surface": "#f5f5f5",
                 "surface_alt": "#e8e8e8",
@@ -132,7 +141,7 @@ class ThemeManager(QObject):
                 "success": "#008080",
                 "warning": "#ff8c00",
                 "error": "#dc3545",
-                "user_message": "#0078d4",
+                "user_message": acc["primary"],
                 "operator_message": "#f0f0f0",
                 "online": "#008080"
             },
@@ -143,23 +152,23 @@ class ThemeManager(QObject):
                         color: #000000;
                     }
                 """,
-                "button": """
-                    QPushButton {
-                        background-color: #0078d4;
-                        border: none;
-                        border-radius: 6px;
-                        color: white;
-                        font-weight: bold;
-                        font-size: 10px;
-                        padding: 8px 12px;
-                    }
-                    QPushButton:hover {
-                        background-color: #106ebe;
-                    }
-                    QPushButton:pressed {
-                        background-color: #005a9e;
-                    }
-                """,
+                "button": f"""
+                   QPushButton {{
+                       background-color: {acc["primary"]};
+                       border: none;
+                       border-radius: 6px;
+                       color: white;
+                       font-weight: bold;
+                       font-size: 10px;
+                       padding: 8px 12px;
+                   }}
+                   QPushButton:hover {{
+                       background-color: {acc["hover"]};
+                   }}
+                   QPushButton:pressed {{
+                       background-color: {acc["pressed"]};
+                   }}
+               """,
                 "input": """
                     QLineEdit, QTextEdit {
                         background-color: #ffffff;
@@ -194,6 +203,51 @@ class ThemeManager(QObject):
                 """
             }
         }
+
+    def get_accent(self):
+        return self._accent
+
+    def set_accent(self, accent_name: str):
+        if accent_name not in self._ACCENTS:
+            return
+        if accent_name == self._accent:
+            return
+        self._accent = accent_name
+        # Пересобираем темы с новым акцентом и оповестим
+        self._themes = {
+            ThemeType.DARK: self._get_dark_theme(),
+            ThemeType.LIGHT: self._get_light_theme()
+        }
+        self.theme_changed.emit(self._current_theme.value)
+
+    def _hex_to_rgb(self, hx):
+        hx = hx.lstrip('#')
+        return tuple(int(hx[i:i+2], 16) for i in (0, 2, 4))
+
+    def _rgb_to_hex(self, rgb):
+        return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+    def _mix(self, rgb, factor):  # factor в диапазоне [-1..1], <0 темнее, >0 светлее
+        if factor < 0:
+            k = 1 + factor
+            return tuple(max(0, int(c * k)) for c in rgb)
+        else:
+            return tuple(min(255, int(c + (255 - c) * factor)) for c in rgb)
+
+    def set_custom_accent(self, primary_hex: str):
+        try:
+            base = self._hex_to_rgb(primary_hex)
+        except Exception:
+            return
+        hover = self._rgb_to_hex(self._mix(base, -0.12))
+        pressed = self._rgb_to_hex(self._mix(base, -0.22))
+        self._ACCENTS["custom"] = {
+            "primary": primary_hex,
+            "hover": hover,
+            "pressed": pressed,
+        }
+        self.set_accent("custom")
+
 
 
 # Глобальный экземпляр менеджера тем

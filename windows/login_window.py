@@ -149,6 +149,25 @@ class LoginWindow(QMainWindow):
         self.dark_theme_action = dark_theme_action
         self.light_theme_action = light_theme_action
 
+        # Подменю "Акцент"
+        accent_menu = view_menu.addMenu('🎨 Акцент')
+
+        from PySide6.QtGui import QActionGroup
+        self.accent_group = QActionGroup(self)
+
+        def add_accent(label, key):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(theme_manager.get_accent() == key)
+            act.triggered.connect(lambda: theme_manager.set_accent(key))
+            self.accent_group.addAction(act)
+            accent_menu.addAction(act)
+
+        add_accent('Синий', 'blue')
+        add_accent('Зелёный', 'green')
+        add_accent('Фиолетовый', 'purple')
+        add_accent('Оранжевый', 'orange')
+
     def set_theme(self, theme_type: ThemeType):
         """Устанавливаем тему"""
         theme_manager.set_theme(theme_type)
