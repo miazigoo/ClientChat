@@ -3,6 +3,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QSettings
 from windows.login_window import LoginWindow
 from styles.theme_manager import theme_manager, ThemeType
+from realtime.server import ChatServer
 
 
 class SupportChatApp:
@@ -16,6 +17,11 @@ class SupportChatApp:
         self.apply_theme()
         theme_manager.theme_changed.connect(self.apply_theme)
 
+        # Старт локального WebSocket-сервера (для демо real-time)
+        self.server = ChatServer()
+        self.server.start_in_background()
+
+        # Окно входа
         self.login_window = LoginWindow()
         self.login_window.show()
 

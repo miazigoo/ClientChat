@@ -18,6 +18,15 @@ from styles.theme_manager import theme_manager, ThemeType
 from data.test_data import TEST_CHATS  # тестовые чаты
 from windows.widgets.chat_list import ChatList
 from realtime.realtime_client import FakeRealtimeClient
+from data.sqlite_store import repo
+
+
+# Попробуем использовать реальный WebSocket-клиент, при ошибке останется заглушка
+try:
+    from realtime.client import ChatClient
+    HAS_WS = True
+except Exception:
+    HAS_WS = False
 
 
 STATUS_CHOICES = ("Новая", "В работе", "Ожидает клиента", "Ожидает оператора", "Закрыта")
@@ -455,12 +464,22 @@ class MainWindow(QMainWindow):
         self.apply_theme()
 
     def _init_realtime(self):
-        self.rtc = FakeRealtimeClient(self.user_data["id"])
-        self.rtc.connected.connect(lambda: self.connection_status.setText("🟢 Подключен"))
-        self.rtc.disconnected.connect(lambda: self.connection_status.setText("🔴 Отключен"))
-        self.rtc.message_received.connect(self._on_rt_message)
-        self.rtc.status_changed.connect(self._on_rt_status)
-        self.rtc.connect()
+        if HAS_WS:
+            # Реальный WebSocket
+            self.ws = ChatClient()
+            self.ws.state_changed.connect(
+                lambda s: self.connection_status.setText("🟢 Подключен" if s == "connected" else "🔴 Отключен")
+            )
+            self.ws.message_received.connect(self._on_ws_message)
+            self.ws.start()
+        else:
+            # Фоллбек-заглушка
+            self.rtc = FakeRealtimeClient(self.user_data["id"])
+            self.rtc.connected.connect(lambda: self.connection_status.setText("🟢 Подключен"))
+            self.rtc.disconnected.connect(lambda: self.connection_status.setText("🔴 Отключен"))
+            self.rtc.message_received.connect(self._on_rt_message)
+            self.rtc.status_changed.connect(self._on_rt_status)
+            self.rtc.connect()
 
     def _on_rt_message(self, chat_id, msg):
         # дополним временем
@@ -469,10 +488,47 @@ class MainWindow(QMainWindow):
         if not chat:
             return
         chat["messages"].append(msg)
+        repo.add_message(chat_id, sender=msg.get("sender", "operator"), text=msg.get("text"),
+                         operator=msg.get("operator"), time_str=msg.get("time"))
+        if chat.get("status") != "В работе":
+            chat["status"] = "В работе"
+            repo.update_chat_status(chat_id, "В работе")
         chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
         self.chat_list.upsert_chat(chat)
         if self.active_chat and self.active_chat["id"] == chat_id:
             self.chat_area.add_message(msg["text"], is_user=(msg.get("sender") == "user"), operator=msg.get("operator"))
+            self.update_header_for_chat()
+
+    def _on_ws_message(self, data: dict):
+        if data.get("type") != "message":
+            return
+        chat_id = data.get("dialog_id")
+        if not chat_id:
+            return
+        # Игнорируем эхо-пакеты от пользователя (мы тут ждём только ответы оператора)
+        if data.get("sender") == "user":
+            return
+
+        msg = {
+            "sender": "operator",
+            "operator": data.get("operator_name", "Оператор"),
+            "text": data.get("text", ""),
+            "time": QDateTime.currentDateTime().toString("hh:mm")
+        }
+        chat = self.chats_by_id.get(chat_id)
+        if not chat:
+            return
+
+        chat["messages"].append(msg)
+        repo.add_message(chat_id, sender="operator", text=msg["text"], operator=msg["operator"], time_str=msg["time"])
+        if chat.get("status") != "В работе":
+            chat["status"] = "В работе"
+            repo.update_chat_status(chat_id, "В работе")
+        chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        self.chat_list.upsert_chat(chat)
+
+        if self.active_chat and self.active_chat["id"] == chat_id:
+            self.chat_area.add_message(msg["text"], is_user=False, operator=msg["operator"])
             self.update_header_for_chat()
 
     def _on_rt_status(self, chat_id, status):
@@ -556,12 +612,13 @@ class MainWindow(QMainWindow):
             self.chat_area.add_attachment(attach, is_user=True)
             msg_time = QDateTime.currentDateTime().toString("hh:mm")
             self.active_chat["messages"].append({"sender": "user", "attachment": attach, "time": msg_time})
+            repo.add_message(self.active_chat["id"], sender="user", attachment=attach, time_str=msg_time)
         # статус
         self.active_chat["status"] = "Ожидает оператора"
         self.active_chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
         self.update_header_for_chat()
         self.chat_list.upsert_chat(self.active_chat)
-        self.rtc.send_message(self.active_chat["id"], "[attachment]")
+        self._rt_send("[attachment]")
 
 
     def create_left_panel(self):
@@ -783,9 +840,9 @@ class MainWindow(QMainWindow):
 
         self.operators_list = QListWidget()
         self.operators_list.setMaximumHeight(120)
-        self.operators_list.addItem("👩‍💼 Анна Петрова")
-        self.operators_list.addItem("👨‍💻 Михаил Сидоров")
-        self.operators_list.addItem("👩‍💻 Елена Козлова")
+        self.operators_list.addItem("👩‍💼 Петрова Аня")
+        self.operators_list.addItem("👨‍💻 Сидоров Михаил")
+        self.operators_list.addItem("👩‍💻 Головач Лена")
 
         self.actions_label = QLabel("Действия:")
         self.actions_label.setFont(QFont("Arial", 11, QFont.Bold))
@@ -848,7 +905,7 @@ class MainWindow(QMainWindow):
     def load_user_chats(self):
         """Загружаем чаты конкретного пользователя из тестовых данных"""
         user_id = self.user_data["id"]
-        self.chats = [c for c in TEST_CHATS if c["user_id"] == user_id]
+        self.chats = repo.load_user_chats(user_id)
         self.chats_by_id = {c["id"]: c for c in self.chats}
 
     def select_initial_chat(self):
@@ -869,28 +926,29 @@ class MainWindow(QMainWindow):
         self.set_active_chat(chat["id"])
 
     def set_active_chat(self, chat_id):
-        if chat_id not in self.chats_by_id:
+        chat = repo.get_chat(chat_id)
+        if not chat:
             return
-        self.active_chat = self.chats_by_id[chat_id]
+        self.chats_by_id[chat_id] = chat
+        self.active_chat = chat
         self.update_header_for_chat()
         self.chat_area.load_messages(self.active_chat.get("messages", []))
         self.center_stack.setCurrentIndex(self.CENTER_CHAT)
         self.chat_list.select_chat(chat_id)
+        self._subscribe_ws(chat_id)
 
     def create_new_chat(self):
         title, ok = self._ask_new_chat_title()
         if not ok:
             return
-        chat = self._create_chat_object(title=title or "Новая заявка", status="Новая")
+        chat = repo.create_chat(self.user_data["id"], title or "Новая заявка")
         self._add_chat(chat)
         self.chat_list.upsert_chat(chat)
         self.set_active_chat(chat["id"])
         self.status_bar.showMessage(f"Создан новый чат {chat['id']}")
 
     def _ask_new_chat_title(self):
-        # Простое окно ввода через QInputDialog можно, но чтобы не плодить зависимости, сделаем плейсхолдер
-        # Можно заменить на QInputDialog.getText(...) при желании
-        return ("Новая заявка", True)
+        return QInputDialog.getText(self, "Новый чат", "Тема обращения:", text="Новая заявка")
 
     def _create_chat_object(self, title, status="Новая"):
         new_id = self._next_chat_id()
@@ -903,7 +961,7 @@ class MainWindow(QMainWindow):
             "created_at": now_dt,
             "updated_at": now_dt,
             "messages": [
-                {"sender": "operator", "operator": "Анна Петрова", "text": "Здравствуйте! Чем можем помочь?", "time": QDateTime.currentDateTime().toString("hh:mm")}
+                {"sender": "operator", "operator": "Головач Лена", "text": "Здравствуйте! Чем можем помочь?", "time": QDateTime.currentDateTime().toString("hh:mm")}
             ]
         }
 
@@ -925,6 +983,7 @@ class MainWindow(QMainWindow):
     def delete_chat(self, chat_id):
         if chat_id not in self.chats_by_id:
             return
+        repo.delete_chat(chat_id)
         deleting_active = (self.active_chat and self.active_chat["id"] == chat_id)
         self.chats = [c for c in self.chats if c["id"] != chat_id]
         self.chats_by_id.pop(chat_id, None)
@@ -947,6 +1006,21 @@ class MainWindow(QMainWindow):
     def open_settings_placeholder(self):
         dlg = SettingsDialog(self)
         dlg.exec()
+
+    def _subscribe_ws(self, chat_id: str):
+        if hasattr(self, "ws") and self.ws:
+            room = f"dialog:{chat_id}"
+            self.ws.subscribe(room)
+
+    def _rt_send(self, text: str):
+        # Отправка через WS или заглушку
+        if self.active_chat is None:
+            return
+        if hasattr(self, "ws") and self.ws:
+            room = f"dialog:{self.active_chat['id']}"
+            self.ws.send_user_message(room, self.active_chat["id"], self.user_data["id"], text)
+        elif hasattr(self, "rtc"):
+            self.rtc.send_message(self.active_chat["id"], text)
 
     # ---------- Отрисовка и статусы ----------
 
@@ -998,11 +1072,13 @@ class MainWindow(QMainWindow):
         # Новый статус
         self.active_chat["status"] = "Ожидает оператора"
         self.active_chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+        repo.add_message(self.active_chat["id"], sender="user", text=text, time_str=msg_time)
+        repo.update_chat_status(self.active_chat["id"], "Ожидает оператора")
         self.update_header_for_chat()
         self.chat_list.upsert_chat(self.active_chat)
 
-        # Отправим в realtime-заглушку
-        self.rtc.send_message(self.active_chat["id"], text)
+        # Отправка через WS или заглушку
+        self._rt_send(text)
 
         self.status_bar.showMessage(f"Сообщение отправлено в {QDateTime.currentDateTime().toString('hh:mm:ss')}")
 
@@ -1227,6 +1303,7 @@ class MainWindow(QMainWindow):
             chat["title"] = new_title.strip()
             chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
             self.chat_list.upsert_chat(chat)
+            repo.rename_chat(chat_id, chat["title"])
             if self.active_chat and self.active_chat["id"] == chat_id:
                 self.update_header_for_chat()
 
@@ -1239,5 +1316,17 @@ class MainWindow(QMainWindow):
         self.chat_list.upsert_chat(chat)
         if self.active_chat and self.active_chat["id"] == chat_id:
             self.update_header_for_chat()
+            repo.update_chat_status(chat_id, status)
             self.apply_theme()
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "ws") and self.ws:
+                self.ws.stop()
+            elif hasattr(self, "rtc"):
+                self.rtc.disconnect()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
 

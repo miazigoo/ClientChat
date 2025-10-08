@@ -41,6 +41,6 @@ class FakeRealtimeClient(QObject):
             "Передаю инженеру.",
             "На вашей стороне все ок, проверим у нас."
         ]
-        msg = {"sender": "operator", "operator": "Анна Петрова", "text": random.choice(responses)}
+        msg = {"sender": "operator", "operator": "Головач Лена", "text": random.choice(responses)}
         self.message_received.emit(chat_id, msg)
         self.status_changed.emit(chat_id, "В работе")
