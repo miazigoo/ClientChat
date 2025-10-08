@@ -4,6 +4,7 @@ import random
 import threading
 from datetime import datetime
 from websockets.server import serve
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
 
 OPERATORS = ["Петрова Аня", "Сидоров Михаил", "Головач Лена"]
@@ -18,6 +19,7 @@ class ChatServer:
         self._rooms = {}  # room -> set of websockets
         self._lock = asyncio.Lock()
         self._thread = None
+        self._agents = {}   # ws -> {"instance_id":..., "operator_id":...}
 
     async def _broadcast(self, room: str, payload: dict):
         msg = json.dumps(payload, ensure_ascii=False)
@@ -68,22 +70,76 @@ class ChatServer:
                     async with self._lock:
                         self._rooms.setdefault(room, set()).add(ws)
 
+                elif data.get("type") == "hello":
+                    ag = data.get("agent") or {}
+                    self._agents[ws] = {
+                        "instance_id": ag.get("instance_id"),
+                        "operator_id": ag.get("operator_id"),
+                    }
+                    # Ответим ack только этому ws
+                    try:
+                        await ws.send(json.dumps({"type": "hello_ack", "ts": now_iso(), "agent": self._agents[ws]},
+                                                 ensure_ascii=False))
+                    except (ConnectionClosedOK, ConnectionClosedError):
+                        pass
+
+
+                elif data.get("type") == "start_chat":
+
+                    room = data.get("room")
+
+                    if not room:
+                        continue
+
+                    async with self._lock:
+
+                        self._rooms.setdefault(room, set()).add(ws)
+
+                    agent = self._agents.get(ws, {})
+
+                    try:
+
+                        await ws.send(json.dumps({
+
+                            "type": "start_chat_ack",
+
+                            "room": room,
+
+                            "dialog_id": data.get("dialog_id"),
+
+                            "user_id": data.get("user_id"),
+
+                            "agent": agent,
+
+                            "ts": now_iso(),
+
+                        }, ensure_ascii=False))
+
+                    except (ConnectionClosedOK, ConnectionClosedError):
+
+                        pass
+
+                    await self._broadcast(room, {
+
+                        "type": "system", "room": room, "dialog_id": data.get("dialog_id"),
+
+                        "text": "Чат инициирован агентом", "agent": agent, "ts": now_iso(),
+
+                    })
+
                 elif data.get("type") == "message":
                     room = data.get("room")
                     if not room:
                         continue
-                    # Рассылаем сообщение всем подписанным
                     await self._broadcast(room, data)
-                    # Если это юзер — эмулируем ответ оператора
                     if data.get("sender") == "user":
                         dialog_id = data.get("dialog_id")
                         asyncio.create_task(self._operator_reply(room, dialog_id))
-
         finally:
-            # Очистим подписки при закрытии
             async with self._lock:
                 for conns in self._rooms.values():
                     conns.discard(ws)
+                self._agents.pop(ws, None)
 
     async def _run(self):
         async with serve(self._handler, self.host, self.port):

@@ -19,6 +19,9 @@ from data.test_data import TEST_CHATS  # тестовые чаты
 from windows.widgets.chat_list import ChatList
 from realtime.realtime_client import FakeRealtimeClient
 from data.sqlite_store import repo
+from agent.agent_ids import read_agent_ids
+import threading
+from integrations.backend_agent_api import BackendAgentAPI
 
 
 # Попробуем использовать реальный WebSocket-клиент, при ошибке останется заглушка
@@ -197,6 +200,8 @@ class ChatArea(QScrollArea):
         self.apply_theme()
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        self.backend_api = BackendAgentAPI()
+        self.backend_rooms = {}  # local_chat_id -> backend room_id
         theme_manager.theme_changed.connect(self.apply_theme)
 
     def dragEnterEvent(self, event):
@@ -459,27 +464,37 @@ class MainWindow(QMainWindow):
         self.load_user_chats()
         self.build_left_list()
         self.show_empty_state()
+        self.agent_ids = read_agent_ids()
         self._init_realtime()
         self.setup_statusbar()
         self.apply_theme()
 
     def _init_realtime(self):
-        if HAS_WS:
-            # Реальный WebSocket
-            self.ws = ChatClient()
+        import os
+        ws_uri = os.getenv("CHAT_WS_URL")  # например ws://127.0.0.1:8765
+        if HAS_WS and ws_uri:
+            self.ws = ChatClient(
+                uri=ws_uri,
+                agent_instance_id=self.agent_ids.instance_id,
+                agent_operator_id=self.agent_ids.operator_id
+            )
             self.ws.state_changed.connect(
                 lambda s: self.connection_status.setText("🟢 Подключен" if s == "connected" else "🔴 Отключен")
             )
             self.ws.message_received.connect(self._on_ws_message)
             self.ws.start()
         else:
-            # Фоллбек-заглушка
+            # Фоллбек на заглушку
             self.rtc = FakeRealtimeClient(self.user_data["id"])
             self.rtc.connected.connect(lambda: self.connection_status.setText("🟢 Подключен"))
             self.rtc.disconnected.connect(lambda: self.connection_status.setText("🔴 Отключен"))
             self.rtc.message_received.connect(self._on_rt_message)
             self.rtc.status_changed.connect(self._on_rt_status)
             self.rtc.connect()
+
+    def _ws_start_chat(self, chat_id: str):
+        if hasattr(self, "ws") and self.ws:
+            self.ws.start_chat(chat_id, self.user_data["id"])
 
     def _on_rt_message(self, chat_id, msg):
         # дополним временем
@@ -619,6 +634,18 @@ class MainWindow(QMainWindow):
         self.update_header_for_chat()
         self.chat_list.upsert_chat(self.active_chat)
         self._rt_send("[attachment]")
+
+        room_id = self.backend_rooms.get(self.active_chat["id"])
+        if room_id:
+            paths = list(paths)  # уже список
+
+            def _send_files():
+                code, resp = self.backend_api.send_message(room_id, self.agent_ids.instance_id, message="[attachment]",
+                                                           files=paths)
+                if not (code and 200 <= code < 300):
+                    print("Backend send_message(files) error:", resp)
+
+            threading.Thread(target=_send_files, daemon=True).start()
 
 
     def create_left_panel(self):
@@ -945,6 +972,25 @@ class MainWindow(QMainWindow):
         self._add_chat(chat)
         self.chat_list.upsert_chat(chat)
         self.set_active_chat(chat["id"])
+
+        def _send_start_backend():
+            code, payload = self.backend_api.start_chat(
+                instance_uid=self.agent_ids.instance_id,
+                crm_operator_fio=self.agent_ids.operator_id,
+                title=title or "Новая заявка",
+                message=""
+            )
+            if code and 200 <= code < 300:
+                room = (payload or {}).get("room") or {}
+                room_id = room.get("id")
+                if room_id:
+                    self.backend_rooms[chat["id"]] = room_id
+            else:
+                print("Backend start_chat error:", payload)
+
+        threading.Thread(target=_send_start_backend, daemon=True).start()
+
+        self._ws_start_chat(chat["id"])
         self.status_bar.showMessage(f"Создан новый чат {chat['id']}")
 
     def _ask_new_chat_title(self):
@@ -1079,6 +1125,15 @@ class MainWindow(QMainWindow):
 
         # Отправка через WS или заглушку
         self._rt_send(text)
+
+        room_id = self.backend_rooms.get(self.active_chat["id"])
+        if room_id:
+            def _send_msg():
+                code, resp = self.backend_api.send_message(room_id, self.agent_ids.instance_id, message=text)
+                if not (code and 200 <= code < 300):
+                    print("Backend send_message error:", resp)
+
+            threading.Thread(target=_send_msg, daemon=True).start()
 
         self.status_bar.showMessage(f"Сообщение отправлено в {QDateTime.currentDateTime().toString('hh:mm:ss')}")
 

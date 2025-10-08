@@ -1,3 +1,4 @@
+import os
 import sys
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QSettings
@@ -17,13 +18,19 @@ class SupportChatApp:
         self.apply_theme()
         theme_manager.theme_changed.connect(self.apply_theme)
 
-        # Старт локального WebSocket-сервера (для демо real-time)
-        self.server = ChatServer()
-        self.server.start_in_background()
+        # # Старт локального WebSocket-сервера (для демо real-time)
+        # self.server = ChatServer()
+        # self.server.start_in_background()
 
         # Окно входа
         self.login_window = LoginWindow()
         self.login_window.show()
+
+        # Старт локального демо-сервера ТОЛЬКО если DEMO_WS=1
+        if os.getenv("DEMO_WS", "0") == "1":
+            from realtime.server import ChatServer
+            self.server = ChatServer()
+            self.server.start_in_background()
 
     def load_user_prefs(self):
         st = QSettings("SupportChat", "ClientApp")
