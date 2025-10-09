@@ -19,7 +19,7 @@ from data.test_data import TEST_CHATS  # тестовые чаты
 from windows.widgets.chat_list import ChatList
 from realtime.realtime_client import FakeRealtimeClient
 from data.sqlite_store import repo
-from agent.agent_ids import read_agent_ids
+from agent.agent_ids import AgentIDs
 import threading
 from integrations.backend_agent_api import BackendAgentAPI
 
@@ -200,8 +200,6 @@ class ChatArea(QScrollArea):
         self.apply_theme()
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
-        self.backend_api = BackendAgentAPI()
-        self.backend_rooms = {}  # local_chat_id -> backend room_id
         theme_manager.theme_changed.connect(self.apply_theme)
 
     def dragEnterEvent(self, event):
@@ -452,6 +450,14 @@ class MainWindow(QMainWindow):
         self.user_data = user_data
         self.main_toolbar = None
 
+        # Backend интеграция (эндпойнты /api/v1/clients/)
+        self.backend_api = BackendAgentAPI()
+        self.backend_rooms = {}  # local_chat_id -> backend room_id
+        self.room_to_local = {}  # backend room_id (str) -> local chat_id
+        self._own_sent_ids = set()  # чтобы не дублировать свои сообщения из WS
+        self.jwt_token = None
+        self.ws_username = None
+
         # Состояние чатов пользователя
         self.chats = []           # список словарей чатов конкретного пользователя
         self.chats_by_id = {}     # индекс по id
@@ -464,37 +470,53 @@ class MainWindow(QMainWindow):
         self.load_user_chats()
         self.build_left_list()
         self.show_empty_state()
-        self.agent_ids = read_agent_ids()
+        self.agent_ids = AgentIDs(
+            instance_id=str(self.user_data["id"]),
+            operator_id=str(self.user_data["name"])
+        )
         self._init_realtime()
         self.setup_statusbar()
         self.apply_theme()
 
     def _init_realtime(self):
         import os
-        ws_uri = os.getenv("CHAT_WS_URL")  # например ws://127.0.0.1:8765
-        if HAS_WS and ws_uri:
-            self.ws = ChatClient(
-                uri=ws_uri,
-                agent_instance_id=self.agent_ids.instance_id,
-                agent_operator_id=self.agent_ids.operator_id
-            )
+        # Авторизация для WS
+        ws_user = os.getenv("WS_AUTH_USER")
+        ws_pass = os.getenv("WS_AUTH_PASSWORD")
+        if ws_user and ws_pass:
+            code, payload = self.backend_api.login(ws_user, ws_pass)
+            if code and 200 <= code < 300:
+                self.jwt_token = payload.get("access")
+        # Если кредов оператора нет — логинимся как клиент по instance из JSON
+        if not self.jwt_token and self.agent_ids and self.agent_ids.instance_id:
+            code, payload = self.backend_api.login_client_instance(self.agent_ids.instance_id)
+            if code and 200 <= code < 300:
+                self.jwt_token = payload.get("access")
+                self.ws_username = payload.get("username")
+        ws_base = os.getenv("DJANGO_WS_BASE", "ws://127.0.0.1/ws/chat")
+        if HAS_WS and self.jwt_token:
+            # Наш ChatClient теперь Channels-совместимый (см. realtime/client.py)
+            self.ws = ChatClient(base_ws=ws_base, token=self.jwt_token)
             self.ws.state_changed.connect(
                 lambda s: self.connection_status.setText("🟢 Подключен" if s == "connected" else "🔴 Отключен")
             )
-            self.ws.message_received.connect(self._on_ws_message)
-            self.ws.start()
+            self.ws.message_received.connect(self._on_django_ws_event)
+            # Подключимся к комнате позже — после получения room_id
         else:
-            # Фоллбек на заглушку
-            self.rtc = FakeRealtimeClient(self.user_data["id"])
-            self.rtc.connected.connect(lambda: self.connection_status.setText("🟢 Подключен"))
-            self.rtc.disconnected.connect(lambda: self.connection_status.setText("🔴 Отключен"))
-            self.rtc.message_received.connect(self._on_rt_message)
-            self.rtc.status_changed.connect(self._on_rt_status)
-            self.rtc.connect()
+            if os.getenv("USE_FAKE_RT", "0") == "1":
+                # Фоллбек на заглушку
+                self.rtc = FakeRealtimeClient(self.user_data["id"])
+                self.rtc.connected.connect(lambda: self.connection_status.setText("🟢 Подключен"))
+                self.rtc.disconnected.connect(lambda: self.connection_status.setText("🔴 Отключен"))
+                self.rtc.message_received.connect(self._on_rt_message)
+                self.rtc.status_changed.connect(self._on_rt_status)
+                self.rtc.connect()
+            else:
+                self.connection_status.setText("🔴 Отключен")
 
     def _ws_start_chat(self, chat_id: str):
-        if hasattr(self, "ws") and self.ws:
-            self.ws.start_chat(chat_id, self.user_data["id"])
+        # Подключение произойдет, когда узнаем backend room_id (см. _subscribe_ws)
+        self._subscribe_ws(chat_id)
 
     def _on_rt_message(self, chat_id, msg):
         # дополним временем
@@ -640,8 +662,7 @@ class MainWindow(QMainWindow):
             paths = list(paths)  # уже список
 
             def _send_files():
-                code, resp = self.backend_api.send_message(room_id, self.agent_ids.instance_id, message="[attachment]",
-                                                           files=paths)
+                code, resp = self.backend_api.send_files(room_id, self.agent_ids.instance_id, files=paths)
                 if not (code and 200 <= code < 300):
                     print("Backend send_message(files) error:", resp)
 
@@ -985,8 +1006,14 @@ class MainWindow(QMainWindow):
                 room_id = room.get("id")
                 if room_id:
                     self.backend_rooms[chat["id"]] = room_id
+                    self.room_to_local[str(room_id)] = chat["id"]
+                    # подключаемся к WS комнате
+                    self._subscribe_ws(chat["id"])
             else:
-                print("Backend start_chat error:", payload)
+                if not (code and 200 <= code < 300):
+                    self.status_bar.showMessage("Не удалось создать комнату на сервере", 5000)
+                else:
+                    print("Backend start_chat error:", payload)
 
         threading.Thread(target=_send_start_backend, daemon=True).start()
 
@@ -1054,18 +1081,17 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _subscribe_ws(self, chat_id: str):
-        if hasattr(self, "ws") and self.ws:
-            room = f"dialog:{chat_id}"
-            self.ws.subscribe(room)
+        # Для Channels: нужно знать backend room_id
+        room_id = self.backend_rooms.get(chat_id)
+        if room_id and hasattr(self, "ws") and self.ws and self.jwt_token:
+            self.ws.connect_room(str(room_id))
 
     def _rt_send(self, text: str):
-        # Отправка через WS или заглушку
+        # При реальном Channels-WS шлем через HTTP (см. send_message),
+        # WS только для приёма. Заглушке — через rtc.
         if self.active_chat is None:
             return
-        if hasattr(self, "ws") and self.ws:
-            room = f"dialog:{self.active_chat['id']}"
-            self.ws.send_user_message(room, self.active_chat["id"], self.user_data["id"], text)
-        elif hasattr(self, "rtc"):
+        if hasattr(self, "rtc"):
             self.rtc.send_message(self.active_chat["id"], text)
 
     # ---------- Отрисовка и статусы ----------
@@ -1132,6 +1158,11 @@ class MainWindow(QMainWindow):
                 code, resp = self.backend_api.send_message(room_id, self.agent_ids.instance_id, message=text)
                 if not (code and 200 <= code < 300):
                     print("Backend send_message error:", resp)
+                else:
+                    # при AGENT_LOG_ONLY=0 backend вернёт структуру с id сообщения
+                    msg_id = str((resp or {}).get("id") or "")
+                    if msg_id:
+                        self._own_sent_ids.add(msg_id)
 
             threading.Thread(target=_send_msg, daemon=True).start()
 
@@ -1384,4 +1415,42 @@ class MainWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
+    def _on_django_ws_event(self, evt: dict):
+        et = evt.get("type")
+        if et == "new_message":
+            m = evt.get("message") or {}
+            # Эхо-фильтр: пропускаем свои же сообщения от клиента
+            if (m.get("senderRole") == "client") or (self.ws_username and m.get("senderName") == self.ws_username):
+                return
+            room_id = str(m.get("roomId") or "")
+            local_id = self.room_to_local.get(room_id)
+            if not local_id:
+                return
+            msg_id = str(m.get("id") or "")
+            # отфильтруем эхо наших отправок через HTTP
+            if msg_id and msg_id in self._own_sent_ids:
+                self._own_sent_ids.discard(msg_id)
+                return
+            sender_name = m.get("senderName") or "Оператор"
+            text = m.get("content") or ""
+            time_str = QDateTime.currentDateTime().toString("hh:mm")
+
+            chat = self.chats_by_id.get(local_id)
+            if not chat:
+                return
+            # Добавляем как ответ оператора (визуально)
+            chat["messages"].append({"sender": "operator", "operator": sender_name, "text": text, "time": time_str})
+            repo.add_message(local_id, sender="operator", text=text, operator=sender_name, time_str=time_str)
+            if chat.get("status") != "В работе":
+                chat["status"] = "В работе"
+                repo.update_chat_status(local_id, "В работе")
+            chat["updated_at"] = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm")
+            self.chat_list.upsert_chat(chat)
+            if self.active_chat and self.active_chat["id"] == local_id:
+                self.chat_area.add_message(text, is_user=False, operator=sender_name)
+                self.update_header_for_chat()
+
+        elif et == "room_update":
+            # Можно обновлять статус по снапшоту комнаты
+            pass
 

@@ -1,2 +1,0 @@
-instance=04b2d61a-fd5e-4d4e-9e97-1f3b4f9c2b11
-operator=Oleg-Kim

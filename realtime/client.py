@@ -1,29 +1,38 @@
 import asyncio
 import json
 import threading
-import uuid
 from typing import Optional
 from PySide6.QtCore import QObject, Signal
 import websockets
 
+
 class ChatClient(QObject):
+    """
+    Channels-совместимый WS-клиент.
+    Подключается к конкретной комнате: ws://host/ws/chat/{room_id}/?token=JWT
+    Получает события:
+      - {"type":"new_message","message":{...}}
+      - {"type":"room_update","room":{...}}
+    Отправка сообщений по WS опциональна (у нас отправка идёт через HTTP).
+    """
     message_received = Signal(dict)
     state_changed = Signal(str)
 
-    def __init__(self, uri: str = "ws://127.0.0.1:8765", *, agent_instance_id: str = None, agent_operator_id: str = None):
+    def __init__(self, base_ws: str = "ws://127.0.0.1/ws/chat", *, token: str = ""):
         super().__init__()
-        self.uri = uri
-        self.client_id = uuid.uuid4().hex
-        self._thread = None
+        self.base_ws = base_ws.rstrip("/")
+        self.token = token
+        self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws = None
-        self._outgoing: Optional[asyncio.Queue] = None
-        self._room: Optional[str] = None
+        self._room_id: Optional[str] = None
         self._stop = threading.Event()
-        self.agent_instance_id = agent_instance_id
-        self.agent_operator_id = agent_operator_id
 
-    def start(self):
+    def connect_room(self, room_id: str | int):
+        """Переподключение к новой комнате: закрываем прежнее, открываем новое соединение."""
+        self._room_id = str(room_id)
+        self.stop()
+        self._stop.clear()
         def runner():
             asyncio.run(self._run())
         self._thread = threading.Thread(target=runner, daemon=True)
@@ -41,34 +50,29 @@ class ChatClient(QObject):
                 pass
 
     async def _run(self):
+        if not self._room_id:
+            return
         self._loop = asyncio.get_running_loop()
-        self._outgoing = asyncio.Queue()
+        url = f"{self.base_ws}/{self._room_id}/?token={self.token}"
         backoff = 1.0
         while not self._stop.is_set():
             try:
-                async with websockets.connect(self.uri) as ws:
+                async with websockets.connect(
+                    url,
+                    ping_interval=30,
+                    ping_timeout=20,
+                    max_queue=64
+                ) as ws:
                     self._ws = ws
                     self.state_changed.emit("connected")
-
-                    # HELLO от агента
-                    await self._send({
-                        "type": "hello",
-                        "client_id": self.client_id,
-                        "agent": {"instance_id": self.agent_instance_id, "operator_id": self.agent_operator_id}
-                    })
-                    # Подписка, если была установлена до подключения
-                    if self._room:
-                        await self._send({"type": "subscribe", "room": self._room})
-
-                    sender = asyncio.create_task(self._sender())
-                    receiver = asyncio.create_task(self._receiver())
-
-                    done, pending = await asyncio.wait(
-                        {sender, receiver},
-                        return_when=asyncio.FIRST_EXCEPTION
-                    )
-                    for t in pending:
-                        t.cancel()
+                    # receiver loop
+                    while not self._stop.is_set():
+                        raw = await ws.recv()
+                        try:
+                            evt = json.loads(raw)
+                        except Exception:
+                            continue
+                        self.message_received.emit(evt)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -81,64 +85,22 @@ class ChatClient(QObject):
                 self.state_changed.emit("disconnected")
                 self._ws = None
 
-    async def _send(self, data: dict):
-        if not self._ws:
+    async def _send_json(self, data: dict):
+        if self._ws:
+            try:
+                await self._ws.send(json.dumps(data, ensure_ascii=False))
+            except Exception:
+                pass
+
+    def send_text(self, content: str, message_type: str = "text"):
+        """
+        Опционально: отправка через WS (создаст сообщение от имени JWT-пользователя).
+        В нашем клиенте основная отправка идёт через HTTP, так что метод можно не использовать.
+        """
+        if not self._loop:
             return
+        payload = {"type": "send_message", "content": content, "message_type": message_type}
         try:
-            await self._ws.send(json.dumps(data, ensure_ascii=False))
+            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self._send_json(payload)))
         except Exception:
             pass
-
-    async def _sender(self):
-        while not self._stop.is_set():
-            try:
-                data = await self._outgoing.get()
-            except asyncio.CancelledError:
-                break
-            await self._send(data)
-
-    async def _receiver(self):
-        while not self._stop.is_set():
-            try:
-                raw = await self._ws.recv()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                self.state_changed.emit("disconnected")
-                break
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            self.message_received.emit(data)
-
-    def subscribe(self, room: str):
-        self._room = room
-        if self._outgoing and self._loop:
-            self._loop.call_soon_threadsafe(lambda: self._outgoing.put_nowait({"type": "subscribe", "room": room}))
-
-    def send_user_message(self, room: str, dialog_id: str, user_id: str, text: str):
-        payload = {
-            "type": "message",
-            "room": room,
-            "dialog_id": dialog_id,
-            "sender": "user",
-            "user_id": user_id,
-            "client_id": self.client_id,
-            "text": text,
-        }
-        if self._outgoing and self._loop:
-            self._loop.call_soon_threadsafe(lambda: self._outgoing.put_nowait(payload))
-
-    def start_chat(self, dialog_id: str, user_id: str):
-        room = f"dialog:{dialog_id}"
-        self.subscribe(room)
-        payload = {
-            "type": "start_chat",
-            "room": room,
-            "dialog_id": dialog_id,
-            "user_id": user_id,
-            "agent": {"instance_id": self.agent_instance_id, "operator_id": self.agent_operator_id},
-        }
-        if self._outgoing and self._loop:
-            self._loop.call_soon_threadsafe(lambda: self._outgoing.put_nowait(payload))

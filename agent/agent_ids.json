@@ -1,0 +1,18 @@
+{
+  "Client_1": {
+    "instance": 3442,
+    "operator": "Oleg Kim"
+  },
+  "Client_2": {
+    "instance": 3443,
+    "operator": "Петрова Аня"
+  },
+  "Client_3": {
+    "instance": 3444,
+    "operator": "Васильев Михаил"
+  },
+  "Client_4": {
+    "instance": 3445,
+    "operator": "Головач Лена"
+  }
+}

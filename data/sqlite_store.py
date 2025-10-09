@@ -3,6 +3,7 @@ import sqlite3
 import random
 from datetime import datetime
 from .test_data import TEST_CHATS
+from os import environ
 
 OPERATORS = ["Петрова Аня", "Сидоров Михаил", "Головач Лена"]
 
@@ -57,6 +58,9 @@ class SQLiteRepo:
         self.conn.commit()
 
     def seed_if_empty(self):
+        # В "боевом" режиме сидинг тестовыми данными отключён
+        if os.environ.get("SEED_TEST_DATA", "0") != "1":
+            return
         cur = self.conn.cursor()
         cnt = cur.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
         if cnt:

@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout,
                                QFrame, QLineEdit)
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QAction
-from data.test_data import TEST_USERS
+import os, json
 from styles.theme_manager import theme_manager, ThemeType
 
 
@@ -242,13 +242,39 @@ class LoginWindow(QMainWindow):
 
     def create_user_cards(self):
         """Создаем карточки пользователей"""
-        for user in TEST_USERS:
+        users = self._load_clients_from_json()
+        for user in users:
             card = UserCard(user)
             card.clicked.connect(self.on_user_selected)
             self.user_cards.append(card)
             self.users_layout.addWidget(card)
 
         self.users_layout.addStretch()
+
+    def _load_clients_from_json(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.normpath(os.path.join(base, "..", "agent", "agent_ids.json"))
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        users = []
+        for key, val in data.items():
+            inst = str(val.get("instance"))
+            operator_name = val.get("operator", key)
+            users.append({
+                "id": inst,
+                "name": operator_name,
+                "email": f"{key.lower()}@example.com",
+                "phone": "",
+                "status": "Клиент",
+                "avatar": "👤",
+            })
+        if not users:
+            users = [{"id": "INST-LOCAL-DEV", "name": "Local Client", "email": "", "phone": "", "status": "Клиент",
+                      "avatar": "👤"}]
+        return users
 
     def filter_users(self, text):
         """Фильтрация пользователей по поисковому запросу"""
