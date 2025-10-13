@@ -1,18 +1,8 @@
 {
   "Client_1": {
-    "instance": 3442,
-    "operator": "Oleg Kim"
-  },
-  "Client_2": {
-    "instance": 3443,
-    "operator": "Петрова Аня"
-  },
-  "Client_3": {
-    "instance": 3444,
-    "operator": "Васильев Михаил"
-  },
-  "Client_4": {
-    "instance": 3445,
-    "operator": "Головач Лена"
+    "fx_id": "d65f17b6215bab5d758ee342ba806b4b",
+    "client_id": 4,
+    "operator_id": "ca77ec81-a5a7-11f0-853d-0c9d92c451db",
+    "name": "Администратор сети"
   }
 }

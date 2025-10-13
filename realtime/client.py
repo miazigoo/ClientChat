@@ -55,32 +55,42 @@ class ChatClient(QObject):
         self._loop = asyncio.get_running_loop()
         url = f"{self.base_ws}/{self._room_id}/?token={self.token}"
         backoff = 1.0
-        while not self._stop.is_set():
+        max_reconnect_attempts = 10
+        reconnect_count = 0
+
+        while not self._stop.is_set() and reconnect_count < max_reconnect_attempts:
             try:
                 async with websockets.connect(
-                    url,
-                    ping_interval=30,
-                    ping_timeout=20,
-                    max_queue=64
+                        url,
+                        ping_interval=30,
+                        ping_timeout=20,
+                        max_queue=64
                 ) as ws:
                     self._ws = ws
+                    reconnect_count = 0  # сбрасываем счетчик при успешном подключении
                     self.state_changed.emit("connected")
-                    # receiver loop
+
                     while not self._stop.is_set():
-                        raw = await ws.recv()
                         try:
+                            raw = await ws.recv()
                             evt = json.loads(raw)
-                        except Exception:
+                            self.message_received.emit(evt)
+                        except websockets.exceptions.ConnectionClosed:
+                            break
+                        except json.JSONDecodeError:
                             continue
-                        self.message_received.emit(evt)
+
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as e:
+                reconnect_count += 1
                 self.state_changed.emit("disconnected")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 10)
-            else:
-                backoff = 1.0
+                if reconnect_count < max_reconnect_attempts:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 10)
+                else:
+                    self.state_changed.emit("max_reconnects_exceeded")
+                    break
             finally:
                 self.state_changed.emit("disconnected")
                 self._ws = None

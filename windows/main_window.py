@@ -1,6 +1,6 @@
 import os
 import mimetypes
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Qt, QTimer, QDateTime, Signal, Slot, QMetaObject
 from PySide6.QtGui import QDesktopServices, QImageReader
 from windows.settings_dialog import SettingsDialog
 from PySide6.QtWidgets import (
@@ -471,11 +471,12 @@ class MainWindow(QMainWindow):
         self.build_left_list()
         self.show_empty_state()
         self.agent_ids = AgentIDs(
-            instance_id=str(self.user_data["id"]),
-            operator_id=str(self.user_data["name"])
+            instance_id=str(self.user_data["id"]),     # временно fx_id, позже заменим на server instance_uid
+            operator_id=str(self.user_data["name"])    # отображаемое ФИО
         )
         self._init_realtime()
         self.setup_statusbar()
+        self.left_chat = False
         self.apply_theme()
 
     def _init_realtime(self):
@@ -488,11 +489,15 @@ class MainWindow(QMainWindow):
             if code and 200 <= code < 300:
                 self.jwt_token = payload.get("access")
         # Если кредов оператора нет — логинимся как клиент по instance из JSON
-        if not self.jwt_token and self.agent_ids and self.agent_ids.instance_id:
-            code, payload = self.backend_api.login_client_instance(self.agent_ids.instance_id)
+        if not self.jwt_token and self.user_data.get("id") and self.user_data.get("operator_id"):
+            code, payload = self.backend_api.fx_login(self.user_data["id"], self.user_data["operator_id"])
             if code and 200 <= code < 300:
                 self.jwt_token = payload.get("access")
                 self.ws_username = payload.get("username")
+                # СЕРВЕРНЫЙ instance_uid — используем далее в start-chat/send
+                inst = payload.get("instance_uid")
+                if inst:
+                    self.agent_ids.instance_id = inst
         ws_base = os.getenv("DJANGO_WS_BASE", "ws://127.0.0.1/ws/chat")
         if HAS_WS and self.jwt_token:
             # Наш ChatClient теперь Channels-совместимый (см. realtime/client.py)
@@ -657,16 +662,7 @@ class MainWindow(QMainWindow):
         self.chat_list.upsert_chat(self.active_chat)
         self._rt_send("[attachment]")
 
-        room_id = self.backend_rooms.get(self.active_chat["id"])
-        if room_id:
-            paths = list(paths)  # уже список
-
-            def _send_files():
-                code, resp = self.backend_api.send_files(room_id, self.agent_ids.instance_id, files=paths)
-                if not (code and 200 <= code < 300):
-                    print("Backend send_message(files) error:", resp)
-
-            threading.Thread(target=_send_files, daemon=True).start()
+        self._send_files_with_retry(self.active_chat["id"], list(paths))
 
 
     def create_left_panel(self):
@@ -810,10 +806,15 @@ class MainWindow(QMainWindow):
         self.ticket_status_label.setFont(QFont("Arial", 9, QFont.Bold))
         self.ticket_status_label.setContentsMargins(8, 2, 8, 2)
 
+        self.operator_count_label = QLabel("")  # «Операторов: N»
+        self.operator_count_label.setFont(QFont("Arial", 9))
+        self.operator_count_label.setContentsMargins(8, 2, 8, 2)
+
         sub_layout.addWidget(self.details_label)
         sub_layout.addSpacing(10)
         sub_layout.addWidget(self.ticket_label)
         sub_layout.addWidget(self.ticket_status_label)
+        sub_layout.addWidget(self.operator_count_label)
         sub_layout.addStretch()
 
         info_layout.addWidget(self.name_label)
@@ -898,6 +899,7 @@ class MainWindow(QMainWindow):
         self.history_btn = QPushButton("📋 История чатов")
         self.settings_btn = QPushButton("⚙️ Настройки")
         self.logout_btn = QPushButton("🚪 Выход")
+        self.leave_chat_btn = QPushButton("⛔ Покинуть чат")
 
         # NEW: быстрый доступ к "Новый чат" через контекст меню правой панели (не обязательно)
         self.new_chat_btn = QPushButton("🆕 Новый чат")
@@ -905,6 +907,7 @@ class MainWindow(QMainWindow):
         self.history_btn.clicked.connect(self.open_history)
         self.new_chat_btn.clicked.connect(self.create_new_chat)
         self.logout_btn.clicked.connect(self.logout)
+        self.leave_chat_btn.clicked.connect(self.leave_chat)
 
         layout.addWidget(self.sidebar_title)
         layout.addWidget(self.user_info)
@@ -914,6 +917,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.new_chat_btn)
         layout.addWidget(self.history_btn)
         layout.addWidget(self.settings_btn)
+        layout.addWidget(self.leave_chat_btn)
         layout.addWidget(self.logout_btn)
         layout.addStretch()
 
@@ -997,7 +1001,7 @@ class MainWindow(QMainWindow):
         def _send_start_backend():
             code, payload = self.backend_api.start_chat(
                 instance_uid=self.agent_ids.instance_id,
-                crm_operator_fio=self.agent_ids.operator_id,
+                crm_client_fio=self.agent_ids.operator_id,
                 title=title or "Новая заявка",
                 message=""
             )
@@ -1085,6 +1089,12 @@ class MainWindow(QMainWindow):
         room_id = self.backend_rooms.get(chat_id)
         if room_id and hasattr(self, "ws") and self.ws and self.jwt_token:
             self.ws.connect_room(str(room_id))
+            self.left_chat = False
+            # Разблокируем ввод при подключении к новой комнате
+            self.message_input.setDisabled(False)
+            self.send_btn.setDisabled(False)
+            self.attach_btn.setDisabled(False)
+            self.apply_theme()
 
     def _rt_send(self, text: str):
         # При реальном Channels-WS шлем через HTTP (см. send_message),
@@ -1114,9 +1124,15 @@ class MainWindow(QMainWindow):
         if not self.active_chat:
             self.ticket_label.setText("")
             self.ticket_status_label.setText("")
+            self.operator_count_label.setText("")
             return
         self.ticket_label.setText(self.active_chat["id"])
-        self.ticket_status_label.setText(self.active_chat["status"])
+        st = self.active_chat["status"]
+        if self.left_chat:
+            st = f"{st} • ПОКИНУТ"
+        self.ticket_status_label.setText(st)
+        count_text = f"Операторов: {self.active_chat.get('operators_count', 0)}"
+        self.operator_count_label.setText(count_text)
         # Стили чипа статуса будут заданы в apply_theme()
 
     # ---------- Ввод/отправка сообщений ----------
@@ -1152,19 +1168,7 @@ class MainWindow(QMainWindow):
         # Отправка через WS или заглушку
         self._rt_send(text)
 
-        room_id = self.backend_rooms.get(self.active_chat["id"])
-        if room_id:
-            def _send_msg():
-                code, resp = self.backend_api.send_message(room_id, self.agent_ids.instance_id, message=text)
-                if not (code and 200 <= code < 300):
-                    print("Backend send_message error:", resp)
-                else:
-                    # при AGENT_LOG_ONLY=0 backend вернёт структуру с id сообщения
-                    msg_id = str((resp or {}).get("id") or "")
-                    if msg_id:
-                        self._own_sent_ids.add(msg_id)
-
-            threading.Thread(target=_send_msg, daemon=True).start()
+        self._send_text_with_retry(self.active_chat["id"], text)
 
         self.status_bar.showMessage(f"Сообщение отправлено в {QDateTime.currentDateTime().toString('hh:mm:ss')}")
 
@@ -1214,6 +1218,9 @@ class MainWindow(QMainWindow):
             self.name_label.setStyleSheet(f"color: {colors['text_primary']};")
             self.details_label.setStyleSheet(f"color: {colors['text_muted']};")
             self.connection_status.setStyleSheet(f"color: {colors['success']};")
+            if self.left_chat:
+                self.connection_status.setStyleSheet(f"color: {colors['error']};")
+                self.connection_status.setText("⛔ Вы покинули чат")
 
             # Чип статуса и тикет
             if self.active_chat:
@@ -1228,6 +1235,8 @@ class MainWindow(QMainWindow):
                 border-radius: 10px;
                 padding: 2px 8px;
             """)
+            if hasattr(self, 'operator_count_label'):
+                self.operator_count_label.setStyleSheet(f"color: {colors['text_secondary']};")
 
         if hasattr(self, 'input_panel'):
             self.input_panel.setStyleSheet(f"""
@@ -1327,6 +1336,7 @@ class MainWindow(QMainWindow):
             """
             for btn in [self.history_btn, self.settings_btn, self.logout_btn, self.new_chat_btn]:
                 btn.setStyleSheet(sidebar_button_style)
+            self.leave_chat_btn.setStyleSheet(sidebar_button_style)
 
         if hasattr(self, 'main_toolbar') and self.main_toolbar:
             self.main_toolbar.setStyleSheet(f"""
@@ -1451,6 +1461,112 @@ class MainWindow(QMainWindow):
                 self.update_header_for_chat()
 
         elif et == "room_update":
-            # Можно обновлять статус по снапшоту комнаты
+            room = evt.get("room") or {}
+            room_id = str(room.get("id") or "")
+            local_id = self.room_to_local.get(room_id)
+            if not local_id:
+                return
+            ops = room.get("operatorsCount")
+            parts = room.get("participantsCount")
+            chat = self.chats_by_id.get(local_id)
+            if chat is None:
+                return
+            if ops is not None:
+                chat["operators_count"] = int(ops)
+            if parts is not None:
+                chat["participants_count"] = int(parts)
+            # Если это активный чат — обновим шапку
+            if self.active_chat and self.active_chat["id"] == local_id:
+                count_text = f"Операторов: {chat.get('operators_count', 0)}"
+                self.operator_count_label.setText(count_text)
+        elif et == "participants_update":
+            # если клиент покинул комнату — можем дополнительно пометить оффлайн
             pass
 
+    def _send_text_with_retry(self, chat_id: str, text: str, attempt: int = 0, max_attempts: int = 40,
+                              delay_ms: int = 100):
+        if attempt >= max_attempts:
+            self.status_bar.showMessage("Превышено максимальное количество попыток отправки", 5000)
+            return
+
+        room_id = self.backend_rooms.get(chat_id)
+        if not room_id:
+            # Используем отдельный таймер для каждой попытки
+            retry_timer = QTimer()
+            retry_timer.setSingleShot(True)
+            retry_timer.timeout.connect(
+                lambda: self._send_text_with_retry(chat_id, text, attempt + 1, max_attempts, delay_ms)
+            )
+            retry_timer.start(delay_ms)
+            return
+
+        def _send_msg():
+            try:
+                code, resp = self.backend_api.send_message(room_id, self.agent_ids.instance_id, message=text)
+                if not (code and 200 <= code < 300):
+                    print("Backend send_message error:", resp)
+                    QMetaObject.invokeMethod(self, "_on_send_error", Qt.QueuedConnection)
+                else:
+                    msg_id = str((resp or {}).get("id") or "")
+                    if msg_id:
+                        self._own_sent_ids.add(msg_id)
+            except Exception as e:
+                print(f"Exception during send: {e}")
+                QMetaObject.invokeMethod(self, "_on_send_error", Qt.QueuedConnection)
+
+        threading.Thread(target=_send_msg, daemon=True).start()
+
+    @Slot()
+    def _on_send_error(self):
+        self.status_bar.showMessage("Ошибка отправки на сервер", 5000)
+
+    def _send_files_with_retry(self, chat_id: str, paths: list[str], attempt: int = 0, max_attempts: int = 40,
+                               delay_ms: int = 100):
+        room_id = self.backend_rooms.get(chat_id)
+        if not room_id:
+            if attempt < max_attempts:
+                QTimer.singleShot(delay_ms,
+                                  lambda: self._send_files_with_retry(chat_id, paths, attempt + 1, max_attempts,
+                                                                      delay_ms))
+            else:
+                self.status_bar.showMessage("Комната на сервере не готова. Повторите попытку.", 5000)
+            return
+
+        def _send_files():
+            code, resp = self.backend_api.send_files(room_id, self.agent_ids.instance_id, files=paths)
+            if not (code and 200 <= code < 300):
+                print("Backend send_files error:", resp)
+                self.status_bar.showMessage("Ошибка загрузки файлов на сервер", 5000)
+
+        threading.Thread(target=_send_files, daemon=True).start()
+
+    def leave_chat(self):
+        if not self.active_chat:
+            return
+        room_id = self.backend_rooms.get(self.active_chat["id"])
+        if not room_id:
+            self.status_bar.showMessage("Комната ещё не создана на сервере", 4000)
+            return
+
+        def _leave():
+            code, resp = self.backend_api.client_leave(room_id, self.agent_ids.instance_id)
+            if code and 200 <= code < 300:
+                QMetaObject.invokeMethod(self, "_on_leave_success_ui", Qt.QueuedConnection)
+            else:
+                QMetaObject.invokeMethod(self, "_on_leave_error_ui", Qt.QueuedConnection)
+
+        threading.Thread(target=_leave, daemon=True).start()
+
+    @Slot()
+    def _on_leave_success_ui(self):
+        self.left_chat = True
+        self.message_input.setDisabled(True)
+        self.send_btn.setDisabled(True)
+        self.attach_btn.setDisabled(True)
+        self.status_bar.showMessage("Вы покинули чат", 5000)
+        self.update_header_for_chat()
+        self.apply_theme()
+
+    @Slot()
+    def _on_leave_error_ui(self):
+        self.status_bar.showMessage("Не удалось покинуть чат", 5000)

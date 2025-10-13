@@ -41,7 +41,6 @@ class SupportChatApp:
             theme_manager.set_custom_accent(primary)
         else:
             theme_manager.set_accent(accent)
-        from styles.theme_manager import ThemeType
         theme_manager.set_theme(ThemeType.LIGHT if theme == "light" else ThemeType.DARK)
 
     def apply_theme(self):

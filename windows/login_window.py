@@ -261,12 +261,16 @@ class LoginWindow(QMainWindow):
             data = {}
         users = []
         for key, val in data.items():
-            inst = str(val.get("instance"))
-            operator_name = val.get("operator", key)
+            fx_id = str(val.get("fx_id"))
+            operator_id = str(val.get("operator_id"))
+            operator_name = val.get("name", key)
+            client_id = int(val.get("client_id", 0))
             users.append({
-                "id": inst,
-                "name": operator_name,
+                "id": fx_id,                 # для UI показываем fx_id как ID
+                "name": operator_name,       # отображаемое имя
                 "email": f"{key.lower()}@example.com",
+                "operator_id": operator_id,
+                "client_id": client_id,
                 "phone": "",
                 "status": "Клиент",
                 "avatar": "👤",
