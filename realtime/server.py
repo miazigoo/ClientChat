@@ -1,13 +1,10 @@
 import asyncio
 import json
-import random
 import threading
 from datetime import datetime
 from websockets.server import serve
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 
-
-OPERATORS = ["Петрова Аня", "Сидоров Михаил", "Головач Лена"]
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat()
@@ -34,25 +31,6 @@ class ChatServer:
             async with self._lock:
                 for ws in to_remove:
                     self._rooms.get(room, set()).discard(ws)
-
-    async def _operator_reply(self, room: str, dialog_id: str):
-        await asyncio.sleep(random.uniform(1.0, 2.5))
-        reply_texts = [
-            "Спасибо за обращение! Сейчас разберемся.",
-            "Передаю ваш запрос специалисту. Ожидайте, пожалуйста.",
-            "Проверяю информацию, одну минуту.",
-            "Попробуйте, пожалуйста, обновить приложение и повторить действие.",
-        ]
-        payload = {
-            "type": "message",
-            "room": room,
-            "dialog_id": dialog_id,
-            "sender": "operator",
-            "operator_name": random.choice(OPERATORS),
-            "text": random.choice(reply_texts),
-            "ts": now_iso(),
-        }
-        await self._broadcast(room, payload)
 
     async def _handler(self, ws):
         # При подключении клиент может подписываться на комнаты: {"type":"subscribe","room":"dialog:XYZ"}
@@ -83,58 +61,40 @@ class ChatServer:
                     except (ConnectionClosedOK, ConnectionClosedError):
                         pass
 
-
                 elif data.get("type") == "start_chat":
-
                     room = data.get("room")
-
                     if not room:
                         continue
 
                     async with self._lock:
-
                         self._rooms.setdefault(room, set()).add(ws)
 
                     agent = self._agents.get(ws, {})
 
                     try:
-
                         await ws.send(json.dumps({
-
                             "type": "start_chat_ack",
-
                             "room": room,
-
                             "dialog_id": data.get("dialog_id"),
-
                             "user_id": data.get("user_id"),
-
                             "agent": agent,
-
                             "ts": now_iso(),
-
                         }, ensure_ascii=False))
-
                     except (ConnectionClosedOK, ConnectionClosedError):
-
                         pass
 
                     await self._broadcast(room, {
-
                         "type": "system", "room": room, "dialog_id": data.get("dialog_id"),
-
                         "text": "Чат инициирован агентом", "agent": agent, "ts": now_iso(),
-
                     })
 
                 elif data.get("type") == "message":
                     room = data.get("room")
                     if not room:
                         continue
+                    # Просто пересылаем сообщение всем участникам комнаты
                     await self._broadcast(room, data)
-                    if data.get("sender") == "user":
-                        dialog_id = data.get("dialog_id")
-                        asyncio.create_task(self._operator_reply(room, dialog_id))
+
         finally:
             async with self._lock:
                 for conns in self._rooms.values():

@@ -295,7 +295,7 @@ class LoginWindow(QMainWindow):
         print(f"Выбран пользователь: {user_data['name']} (ID: {user_data['id']})")
 
         # Импортируем здесь чтобы избежать циклического импорта
-        from windows.main_window import MainWindow
+        from windows.main_window.main_window import MainWindow
 
         # Открываем главное окно
         self.main_window = MainWindow(user_data)
