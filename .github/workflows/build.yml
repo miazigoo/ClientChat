@@ -22,15 +22,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: |
-          pyinstaller ^
-            --noconfirm ^
-            --windowed ^
-            --name SupportChat ^
-            --collect-all PySide6 ^
-            --collect-submodules websockets ^
-            --add-data "agent/agent_ids.json;agent" ^
-            main.py
+        run: pyinstaller --noconfirm --windowed --name SupportChat --collect-all PySide6 --collect-submodules websockets --add-data "agent/agent_ids.json;agent" main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
