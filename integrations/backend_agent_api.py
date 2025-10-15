@@ -1,7 +1,8 @@
 import os
 import requests
 
-DEFAULT_BASE = os.environ.get("BACKEND_BASE_URL", "http://127.0.0.1/api/v1")
+# DEFAULT_BASE = os.environ.get("BACKEND_BASE_URL", "http://127.0.0.1/api/v1")
+DEFAULT_BASE = os.environ.get("BACKEND_BASE_URL", "http://89.104.67.225/api/v1")
 
 class BackendAgentAPI:
     def __init__(self, base_url: str = None):
