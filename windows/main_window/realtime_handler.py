@@ -56,7 +56,7 @@ class RealtimeHandler:
                 if inst:
                     mw.agent_ids.instance_id = inst
 
-        ws_base = os.getenv("DJANGO_WS_BASE", "ws://127.0.0.1:80/ws/chat")
+        ws_base = os.getenv("DJANGO_WS_BASE", "ws://89.104.67.225:80/ws/chat")
         print(f"DEBUG: ws_base = {ws_base}")
         print(f"DEBUG: final jwt_token = {'Present' if mw.jwt_token else 'None'}")
 
@@ -411,3 +411,26 @@ class RealtimeHandler:
                 mw.rtc.disconnect()
         except Exception:
             pass
+
+    def leave_chat_for(self, chat_id: str, *, update_ui: bool = False):
+        """Покинуть указанный чат (может быть неактивным).
+           update_ui=True — обновить UI, только если этот чат активен.
+        """
+        mw = self.main_window
+
+        room_id = mw.backend_rooms.get(chat_id)
+        if not room_id:
+            # Комната ещё не создана на сервере — просто выходим
+            return
+
+        def _leave():
+            code, resp = mw.backend_api.client_leave(room_id, mw.agent_ids.instance_id)
+            if not (code and 200 <= code < 300):
+                # игнорируем ошибку на массовых операциях удаления
+                return
+
+            if update_ui and mw.active_chat and mw.active_chat["id"] == chat_id:
+                from PySide6.QtCore import QMetaObject, Qt
+                QMetaObject.invokeMethod(mw, "_on_leave_success_ui", Qt.QueuedConnection)
+
+        threading.Thread(target=_leave, daemon=True).start()

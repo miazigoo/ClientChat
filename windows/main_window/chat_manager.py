@@ -191,6 +191,12 @@ class ChatManager:
         if chat_id not in mw.chats_by_id:
             return
 
+        # сначала попросим сервер «покинуть чат» (если есть room_id)
+        try:
+            mw.realtime_handler.leave_chat_for(chat_id, update_ui=False)
+        except Exception:
+            pass  # не мешаем локальному удалению
+
         repo.delete_chat(chat_id)
         deleting_active = (mw.active_chat and mw.active_chat["id"] == chat_id)
         mw.chats = [c for c in mw.chats if c["id"] != chat_id]

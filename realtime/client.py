@@ -14,7 +14,7 @@ class ChatClient(QObject):
     state_changed = Signal(str)
     connection_error = Signal(str)
 
-    def __init__(self, base_ws: str = "ws://127.0.0.1/ws/chat", *, token: str = ""):
+    def __init__(self, base_ws: str = "ws://89.104.67.225/ws/chat", *, token: str = ""):
         super().__init__()
         self.base_ws = base_ws.rstrip("/")
         self.token = token
